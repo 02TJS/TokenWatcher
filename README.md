@@ -1,15 +1,22 @@
 # TokenWatcher
 
-TokenWatcher is a lightweight Windows desktop overlay that displays the three most-used AI models and their exact token counts. It reads local Codex, Claude Code, Cline, and DeepSeek API usage data and refreshes the overlay every 0.5 seconds while using native Windows filesystem notifications for local log changes.
+TokenWatcher is a lightweight Windows desktop overlay that displays a user-adjustable number of the most-used AI models, their exact token counts, each newly observed token increment, and cumulative standard-API-equivalent cost in USD. It reads local Codex, Claude Code, Cline, and DeepSeek API usage data and refreshes the overlay every 0.25 seconds by default while using native Windows filesystem notifications for local log changes.
 
 ## Features
 
-- Top-three models for today, this week, this month, or all time
+- Adjustable Top 1-10 models for today, this week, this month, or all time
 - Exact token totals without K/M/B abbreviation
+- Claude Code totals include input, output, cache-read, and cache-creation tokens
+- A temporary green `+Token` value showing the exact newly observed increment
 - Per-model request counts
+- Platform-colored model badges without a separate platform-name column
+- Per-model USD cost with a green rolling animation when it increases
+- User-adjustable 70%-140% interface scale, persisted between launches
+- Bottom `增加列` and `减少列` controls with a persisted row count and matching window height
+- Right-click row controls and a persisted 0.1/0.25/0.5/1/2-second refresh selector
 - Event-driven log discovery, incremental tailing, and cached summary/task files
 - Automatic one-pass reconciliation after Windows notification-buffer loss; a 30-second discovery fallback is used only while native notifications are unavailable
-- Codex cumulative-snapshot deduplication across continued or forked tasks
+- Codex cumulative-snapshot deduplication across continued, forked, and subagent tasks; replayed parent history is deduplicated by lineage, and missing `turn_context` models are inherited automatically
 - Persistent Codex fingerprint/offset cache for fast restarts
 - Immediate startup display from the last verified aggregate snapshot; live sources reconcile it in the background
 - Field-level adaptive pure-color text: every text field uses one crisp black or white foreground while the overlay remains transparent
@@ -44,7 +51,7 @@ Right-click the overlay to switch the time period, open an optional full report,
 
 ## Optional baseline report
 
-TokenWatcher can run without a generated report. If a compatible report already exists, point the app to the directory containing `summary.json`, `model_total.csv`, and `daily_by_platform_model.csv`:
+TokenWatcher can run without a generated report. If a compatible report already exists, point the app to the directory containing the token CSVs plus `model_cost.csv`, `daily_cost_by_platform_model.csv`, and `pricing_used.csv`:
 
 ```powershell
 $env:AI_USAGE_REPORT_DIR = 'D:\path\to\report'

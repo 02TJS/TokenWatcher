@@ -23,12 +23,17 @@ from pathlib import Path
 APP_TITLE = "TokenWatcher"
 INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
 START_DATE = date(2026, 2, 1)
-REFRESH_SECONDS = 0.5
+DEFAULT_REFRESH_SECONDS = 0.25
+MIN_REFRESH_SECONDS = 0.1
+MAX_REFRESH_SECONDS = 2.0
+REFRESH_OPTIONS = (0.1, 0.25, 0.5, 1.0, 2.0)
+REFRESH_SECONDS = DEFAULT_REFRESH_SECONDS
 STARTUP_HOT_SECONDS = 300.0
 REFERENCE_FILE_CHECK_SECONDS = 5.0
 FALLBACK_RESCAN_SECONDS = 30.0
 REPORT_CHECK_SECONDS = 10.0
 FINGERPRINT_COMPACT_THRESHOLD = 4096
+LONG_CONTEXT_THRESHOLD = 272_000
 SHANGHAI = timezone(timedelta(hours=8))
 PERIODS = ("today", "week", "month", "cumulative")
 PERIOD_LABELS = {
@@ -76,27 +81,301 @@ CODEX_USAGE_KEYS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
-CODEX_CACHE_VERSION = 4
-CLAUDE_CACHE_VERSION = 1
-USAGE_SNAPSHOT_CACHE_VERSION = 3
+CODEX_CACHE_VERSION = 7
+CLAUDE_CACHE_VERSION = 4
+USAGE_SNAPSHOT_CACHE_VERSION = 7
 WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 CASCADIA_MONO_FONT = str(WINDOWS_FONTS / "CascadiaMono.ttf")
 YAHEI_FONT = str(WINDOWS_FONTS / "msyh.ttc")
 YAHEI_BOLD_FONT = str(WINDOWS_FONTS / "msyhbd.ttc")
-WINDOW_WIDTH = 720
+WINDOW_WIDTH = 852
 WINDOW_HEIGHT = 260
 ROW_HEIGHT = 56
 ROW_MIDDLE = ROW_HEIGHT // 2
+DEFAULT_ROW_COUNT = 3
+MIN_ROW_COUNT = 1
+MAX_ROW_COUNT = 10
+ROW_COUNT_LABELS = (
+    "零",
+    "一",
+    "二",
+    "三",
+    "四",
+    "五",
+    "六",
+    "七",
+    "八",
+    "九",
+    "十",
+)
 BODY_FONT_SIZE = 26
 TITLE_FONT_SIZE = 28
-PLATFORM_BADGE_FONT_SIZE = 18
+MODEL_BADGE_FONT_SIZE = BODY_FONT_SIZE
+DELTA_FONT_SIZE = BODY_FONT_SIZE
+COST_FONT_SIZE = BODY_FONT_SIZE
+VALUE_COLUMN_GAP = 20
+MODEL_CALL_LEFT_SHIFT = 16
+RANK_LEFT_SHIFT = 16
 RANK_COLUMN_WIDTH = 28
-PLATFORM_COLUMN_WIDTH = 82
-MODEL_COLUMN_WIDTH = 125
-CALL_COLUMN_WIDTH = 90
-DELTA_COLUMN_WIDTH = 140
-TOKEN_COLUMN_WIDTH = 210
-FOOTER_COLUMN_WIDTH = WINDOW_WIDTH - 80
+MODEL_COLUMN_WIDTH = 116
+CALL_COLUMN_WIDTH = 100
+DELTA_COLUMN_WIDTH = 132
+TOKEN_COLUMN_WIDTH = 218
+COST_COLUMN_WIDTH = 150
+FOOTER_CONTROL_WIDTH = 68
+FOOTER_COLUMN_WIDTH = WINDOW_WIDTH - 80 - (2 * FOOTER_CONTROL_WIDTH)
+DEFAULT_UI_SCALE = 0.9
+MIN_UI_SCALE = 0.7
+MAX_UI_SCALE = 1.4
+UI_SCALE_STEP = 0.05
+UI_SETTINGS_PATH = Path.home() / ".tokenwatcher" / "ui_settings.json"
+BASE_UI_METRICS = {
+    "WINDOW_WIDTH": WINDOW_WIDTH,
+    "WINDOW_HEIGHT": WINDOW_HEIGHT,
+    "ROW_HEIGHT": ROW_HEIGHT,
+    "BODY_FONT_SIZE": BODY_FONT_SIZE,
+    "TITLE_FONT_SIZE": TITLE_FONT_SIZE,
+    "MODEL_BADGE_FONT_SIZE": MODEL_BADGE_FONT_SIZE,
+    "DELTA_FONT_SIZE": DELTA_FONT_SIZE,
+    "COST_FONT_SIZE": COST_FONT_SIZE,
+    "RANK_COLUMN_WIDTH": RANK_COLUMN_WIDTH,
+    "MODEL_COLUMN_WIDTH": MODEL_COLUMN_WIDTH,
+    "CALL_COLUMN_WIDTH": CALL_COLUMN_WIDTH,
+    "DELTA_COLUMN_WIDTH": DELTA_COLUMN_WIDTH,
+    "TOKEN_COLUMN_WIDTH": TOKEN_COLUMN_WIDTH,
+    "COST_COLUMN_WIDTH": COST_COLUMN_WIDTH,
+    "FOOTER_CONTROL_WIDTH": FOOTER_CONTROL_WIDTH,
+    "VALUE_COLUMN_GAP": VALUE_COLUMN_GAP,
+    "MODEL_CALL_LEFT_SHIFT": MODEL_CALL_LEFT_SHIFT,
+    "RANK_LEFT_SHIFT": RANK_LEFT_SHIFT,
+}
+
+
+def scaled(value: int, scale: float) -> int:
+    return max(1, round(value * scale))
+
+
+def apply_ui_scale(value: float) -> float:
+    global WINDOW_WIDTH, WINDOW_HEIGHT, ROW_HEIGHT, ROW_MIDDLE
+    global BODY_FONT_SIZE, TITLE_FONT_SIZE, MODEL_BADGE_FONT_SIZE
+    global DELTA_FONT_SIZE, COST_FONT_SIZE, RANK_COLUMN_WIDTH
+    global MODEL_COLUMN_WIDTH, CALL_COLUMN_WIDTH, DELTA_COLUMN_WIDTH
+    global TOKEN_COLUMN_WIDTH, COST_COLUMN_WIDTH, VALUE_COLUMN_GAP
+    global MODEL_CALL_LEFT_SHIFT, RANK_LEFT_SHIFT
+    global FOOTER_CONTROL_WIDTH, FOOTER_COLUMN_WIDTH
+
+    value = min(MAX_UI_SCALE, max(MIN_UI_SCALE, float(value)))
+    for name, base_value in BASE_UI_METRICS.items():
+        globals()[name] = scaled(base_value, value)
+    ROW_MIDDLE = ROW_HEIGHT // 2
+    FOOTER_COLUMN_WIDTH = (
+        WINDOW_WIDTH - scaled(80, value) - (2 * FOOTER_CONTROL_WIDTH)
+    )
+    return value
+
+
+def clamp_row_count(value: int) -> int:
+    return min(MAX_ROW_COUNT, max(MIN_ROW_COUNT, int(value)))
+
+
+def row_count_label(value: int) -> str:
+    return ROW_COUNT_LABELS[clamp_row_count(value)]
+
+
+def window_height_for_rows(row_count: int) -> int:
+    return WINDOW_HEIGHT + (
+        clamp_row_count(row_count) - DEFAULT_ROW_COUNT
+    ) * ROW_HEIGHT
+
+
+def _read_ui_settings(settings_path: Path) -> dict:
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def _save_ui_settings(updates: dict, settings_path: Path) -> None:
+    temporary_path = settings_path.with_name(
+        f"{settings_path.name}.{os.getpid()}.tmp"
+    )
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings = _read_ui_settings(settings_path)
+        settings.update(updates)
+        temporary_path.write_text(
+            json.dumps(settings, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, settings_path)
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_ui_scale(settings_path: Path = UI_SETTINGS_PATH) -> float:
+    environment_value = os.environ.get("TOKENWATCHER_UI_SCALE", "").strip()
+    try:
+        value = (
+            float(environment_value)
+            if environment_value
+            else float(_read_ui_settings(settings_path).get("scale", DEFAULT_UI_SCALE))
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        value = DEFAULT_UI_SCALE
+    return min(MAX_UI_SCALE, max(MIN_UI_SCALE, value))
+
+
+def save_ui_scale(
+    value: float,
+    settings_path: Path = UI_SETTINGS_PATH,
+) -> None:
+    _save_ui_settings({"scale": round(value, 2)}, settings_path)
+
+
+def load_row_count(settings_path: Path = UI_SETTINGS_PATH) -> int:
+    environment_value = os.environ.get("TOKENWATCHER_ROW_COUNT", "").strip()
+    try:
+        value = int(
+            environment_value
+            if environment_value
+            else _read_ui_settings(settings_path).get(
+                "row_count",
+                DEFAULT_ROW_COUNT,
+            )
+        )
+    except (ValueError, TypeError):
+        value = DEFAULT_ROW_COUNT
+    return clamp_row_count(value)
+
+
+def save_row_count(
+    value: int,
+    settings_path: Path = UI_SETTINGS_PATH,
+) -> None:
+    _save_ui_settings({"row_count": clamp_row_count(value)}, settings_path)
+
+
+def clamp_refresh_seconds(value: float) -> float:
+    return min(MAX_REFRESH_SECONDS, max(MIN_REFRESH_SECONDS, float(value)))
+
+
+def apply_refresh_seconds(value: float) -> float:
+    global REFRESH_SECONDS
+    REFRESH_SECONDS = clamp_refresh_seconds(value)
+    return REFRESH_SECONDS
+
+
+def load_refresh_seconds(settings_path: Path = UI_SETTINGS_PATH) -> float:
+    environment_value = os.environ.get(
+        "TOKENWATCHER_REFRESH_SECONDS",
+        "",
+    ).strip()
+    try:
+        value = float(
+            environment_value
+            if environment_value
+            else _read_ui_settings(settings_path).get(
+                "refresh_seconds",
+                DEFAULT_REFRESH_SECONDS,
+            )
+        )
+    except (ValueError, TypeError):
+        value = DEFAULT_REFRESH_SECONDS
+    return clamp_refresh_seconds(value)
+
+
+def save_refresh_seconds(
+    value: float,
+    settings_path: Path = UI_SETTINGS_PATH,
+) -> None:
+    _save_ui_settings(
+        {"refresh_seconds": round(clamp_refresh_seconds(value), 2)},
+        settings_path,
+    )
+
+
+def format_refresh_seconds(value: float) -> str:
+    return f"{clamp_refresh_seconds(value):g}"
+
+DEFAULT_PRICES = {
+    "gpt-5.2-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
+    "gpt-5.3-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
+    "gpt-5.4": {
+        "input": 2.5,
+        "cached": 0.25,
+        "output": 15.0,
+        "long_input": 5.0,
+        "long_cached": 0.5,
+        "long_output": 22.5,
+    },
+    "gpt-5.4-mini": {"input": 0.75, "cached": 0.075, "output": 4.5},
+    "gpt-5.5": {
+        "input": 5.0,
+        "cached": 0.5,
+        "output": 30.0,
+        "long_input": 10.0,
+        "long_cached": 1.0,
+        "long_output": 45.0,
+    },
+    "gpt-5.6-sol": {
+        "input": 5.0,
+        "cached": 0.5,
+        "cache_write": 6.25,
+        "output": 30.0,
+        "long_input": 10.0,
+        "long_cached": 1.0,
+        "long_cache_write": 12.5,
+        "long_output": 45.0,
+    },
+    "gpt-5.6-terra": {
+        "input": 2.5,
+        "cached": 0.25,
+        "cache_write": 3.125,
+        "output": 15.0,
+        "long_input": 5.0,
+        "long_cached": 0.5,
+        "long_cache_write": 6.25,
+        "long_output": 22.5,
+    },
+    "gpt-5.6-luna": {
+        "input": 1.0,
+        "cached": 0.1,
+        "cache_write": 1.25,
+        "output": 6.0,
+        "long_input": 2.0,
+        "long_cached": 0.2,
+        "long_cache_write": 2.5,
+        "long_output": 9.0,
+    },
+    "claude-opus-4.8": {
+        "input": 5.0,
+        "cached": 0.5,
+        "cache_write": 6.25,
+        "output": 25.0,
+    },
+    "claude-opus-4-8": {
+        "input": 5.0,
+        "cached": 0.5,
+        "cache_write": 6.25,
+        "output": 25.0,
+    },
+    "claude-sonnet-4.6": {
+        "input": 3.0,
+        "cached": 0.3,
+        "cache_write": 3.75,
+        "output": 15.0,
+    },
+    "deepseek-v4-pro": {
+        "input": 0.435,
+        "cached": 0.003625,
+        "cache_write": 0.435,
+        "output": 0.87,
+    },
+}
 
 
 def _percentile(values: list[float], fraction: float) -> float:
@@ -318,6 +597,27 @@ def codex_fingerprint_digest(fingerprint: tuple) -> bytes:
     return hashlib.blake2b(payload, digest_size=16).digest()
 
 
+def codex_parent_session_id(payload: dict) -> str:
+    """Return the parent session recorded by Codex subagent/fork metadata."""
+    session_id = str(payload.get("id") or "")
+    source = payload.get("source") or {}
+    source = source if isinstance(source, dict) else {}
+    subagent = source.get("subagent") or {}
+    subagent = subagent if isinstance(subagent, dict) else {}
+    thread_spawn = subagent.get("thread_spawn") or {}
+    thread_spawn = thread_spawn if isinstance(thread_spawn, dict) else {}
+    for candidate in (
+        payload.get("parent_thread_id"),
+        payload.get("forked_from_id"),
+        thread_spawn.get("parent_thread_id"),
+        payload.get("session_id"),
+    ):
+        candidate = str(candidate or "")
+        if candidate and candidate != session_id:
+            return candidate
+    return ""
+
+
 class DirectoryChangeWatcher:
     """Collect recursive Windows directory changes without rescanning the tree."""
 
@@ -530,6 +830,12 @@ def format_tokens(value: int) -> str:
     return f"{int(value):,}"
 
 
+def format_cost(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"${float(value):,.2f}"
+
+
 def compact_model_name(model: str) -> str:
     name = model.strip()
     lower = name.lower()
@@ -606,6 +912,16 @@ def add_period_usage(
         periods[period][key] += int(tokens)
 
 
+def add_period_cost(
+    periods: dict[str, Counter],
+    key: tuple[str, str],
+    cost_usd: float,
+    event_date: date,
+) -> None:
+    for period in active_periods(event_date):
+        periods[period][key] += float(cost_usd)
+
+
 def find_report_dir() -> Path:
     configured = os.environ.get("AI_USAGE_REPORT_DIR")
     candidates = [Path(configured).expanduser()] if configured else []
@@ -635,12 +951,91 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def load_pricing(report_dir: Path) -> dict[str, dict[str, float]]:
+    prices = {model: dict(values) for model, values in DEFAULT_PRICES.items()}
+    path = report_dir / "pricing_used.csv"
+    if not path.exists():
+        return prices
+    try:
+        rows = read_csv(path)
+    except OSError:
+        return prices
+    field_map = {
+        "input": "input_usd_per_mtok",
+        "cached": "cached_input_usd_per_mtok",
+        "cache_write": "cache_write_usd_per_mtok",
+        "output": "output_usd_per_mtok",
+        "long_input": "long_input_usd_per_mtok",
+        "long_cached": "long_cached_input_usd_per_mtok",
+        "long_output": "long_output_usd_per_mtok",
+    }
+    for row in rows:
+        if row.get("pricing_status") != "official_standard_price":
+            continue
+        values = {}
+        try:
+            for name, field_name in field_map.items():
+                raw_value = str(row.get(field_name) or "").strip()
+                if raw_value:
+                    values[name] = float(raw_value)
+        except ValueError:
+            continue
+        if "input" in values and "output" in values:
+            prices[str(row.get("model") or "<unknown>")] = values
+    return prices
+
+
+def usage_cost_usd(
+    model: str,
+    usage: dict,
+    *,
+    source: str,
+    prices: dict[str, dict[str, float]] | None = None,
+    context_window: int = 0,
+) -> float | None:
+    price = (prices or DEFAULT_PRICES).get(model)
+    if price is None:
+        return None
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    if source == "codex":
+        cached_tokens = int(usage.get("cached_input_tokens") or 0)
+        uncached_tokens = max(0, input_tokens - cached_tokens)
+        cache_write_tokens = 0
+        long_context = (
+            "long_input" in price
+            and context_window > LONG_CONTEXT_THRESHOLD
+            and input_tokens > LONG_CONTEXT_THRESHOLD
+        )
+    else:
+        uncached_tokens = input_tokens
+        cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
+        cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+        long_context = (
+            "long_input" in price
+            and uncached_tokens + cached_tokens + cache_write_tokens
+            > LONG_CONTEXT_THRESHOLD
+        )
+    prefix = "long_" if long_context else ""
+    input_price = price[f"{prefix}input"]
+    cached_price = price.get(f"{prefix}cached", input_price)
+    output_price = price[f"{prefix}output"]
+    cache_write_price = price.get(f"{prefix}cache_write", cached_price)
+    return (
+        uncached_tokens * input_price
+        + cached_tokens * cached_price
+        + cache_write_tokens * cache_write_price
+        + output_tokens * output_price
+    ) / 1_000_000
+
+
 @dataclass
 class Baseline:
     report_dir: Path
     refreshed_at: datetime
     periods: dict[str, Counter] = field(default_factory=empty_periods)
     call_periods: dict[str, Counter] = field(default_factory=empty_periods)
+    cost_periods: dict[str, Counter] = field(default_factory=empty_periods)
     report_mtime: float = 0.0
 
 
@@ -679,6 +1074,22 @@ def load_baseline(report_dir: Path) -> Baseline:
                 baseline.call_periods[period][key] += calls
                 if period != "cumulative":
                     baseline.periods[period][key] += tokens
+    model_cost_path = report_dir / "model_cost.csv"
+    if model_cost_path.exists():
+        for row in read_csv(model_cost_path):
+            key = (row["platform"], row["model"])
+            baseline.cost_periods["cumulative"][key] += float(
+                row["estimated_cost_usd"]
+            )
+    daily_cost_path = report_dir / "daily_cost_by_platform_model.csv"
+    if daily_cost_path.exists():
+        for row in read_csv(daily_cost_path):
+            row_date = date.fromisoformat(row["date"])
+            key = (row["platform"], row["model"])
+            cost_usd = float(row["estimated_cost_usd"])
+            for period in active_periods(row_date, now_date):
+                if period != "cumulative":
+                    baseline.cost_periods[period][key] += cost_usd
     return baseline
 
 
@@ -688,11 +1099,22 @@ class CodexFileState:
     remainder: bytes = b""
     model: str = "<unknown>"
     session_id: str = ""
+    parent_session_id: str = ""
     last_mtime: float = 0.0
     last_size: int = 0
     next_check: float = 0.0
     watching: bool = True
     stop_after_initial: bool = False
+
+
+@dataclass
+class CodexPendingUsage:
+    fingerprint: bytes
+    session_id: str
+    total_tokens: int
+    usage: dict
+    context_window: int
+    event_time: datetime
 
 
 class CodexTailTracker:
@@ -701,6 +1123,7 @@ class CodexTailTracker:
         since: datetime,
         watcher: DirectoryChangeWatcher | None = None,
         cache_path: Path | None = None,
+        prices: dict[str, dict[str, float]] | None = None,
     ):
         self.since = since.astimezone(timezone.utc)
         self.root = Path.home() / ".codex"
@@ -709,12 +1132,18 @@ class CodexTailTracker:
         )
         self._owns_watcher = watcher is None
         self.watcher = watcher or DirectoryChangeWatcher(self.root)
+        self.prices = prices or DEFAULT_PRICES
         self.states: dict[Path, CodexFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
+        self.cost_periods = empty_periods()
         self.seen_packed = b""
         self.seen: set[bytes] = set()
         self.cached_files: dict[str, dict] = {}
+        self.session_models: dict[str, str] = {}
+        self.session_parents: dict[str, str] = {}
+        self.pending_usage: dict[str, list[CodexPendingUsage]] = {}
+        self.pending_fingerprints: set[bytes] = set()
         self.cache_dirty = False
         self.last_event: datetime | None = None
         self.errors = 0
@@ -722,6 +1151,104 @@ class CodexTailTracker:
         self.next_fallback_check = 0.0
         self._load_cache()
         self._discover_startup()
+
+    @staticmethod
+    def _known_model(model: str | None) -> bool:
+        return bool(model and model != "<unknown>")
+
+    def _resolve_session_model(
+        self,
+        session_id: str,
+        visited: set[str] | None = None,
+    ) -> str | None:
+        if not session_id:
+            return None
+        model = self.session_models.get(session_id)
+        if self._known_model(model):
+            return model
+        visited = set() if visited is None else visited
+        if session_id in visited:
+            return None
+        visited.add(session_id)
+        parent_id = self.session_parents.get(session_id, "")
+        if not parent_id:
+            return None
+        model = self._resolve_session_model(parent_id, visited)
+        if model:
+            self.session_models[session_id] = model
+        return model
+
+    def _resolve_lineage_root(self, session_id: str) -> str:
+        current_id = str(session_id or "")
+        if not current_id:
+            return ""
+        visited = set()
+        while current_id not in visited:
+            visited.add(current_id)
+            parent_id = self.session_parents.get(current_id, "")
+            if not parent_id:
+                return current_id
+            current_id = parent_id
+        return min(visited)
+
+    def _register_state_model(self, state: CodexFileState) -> None:
+        if not state.session_id:
+            return
+        if state.parent_session_id:
+            self.session_parents[state.session_id] = state.parent_session_id
+        if self._known_model(state.model):
+            self.session_models[state.session_id] = state.model
+        inherited = self._resolve_session_model(state.session_id)
+        if inherited and not self._known_model(state.model):
+            state.model = inherited
+        self._propagate_resolved_models()
+        self._flush_pending_usage()
+
+    def _propagate_resolved_models(self) -> None:
+        for state in self.states.values():
+            model = self._resolve_session_model(state.session_id)
+            if model and not self._known_model(state.model):
+                state.model = model
+        for record in self.cached_files.values():
+            session_id = str(record.get("session_id") or "")
+            model = self._resolve_session_model(session_id)
+            if model and not self._known_model(str(record.get("model") or "")):
+                record["model"] = model
+                self.cache_dirty = True
+
+    def _add_resolved_usage(self, model: str, pending: CodexPendingUsage) -> None:
+        key = ("Codex", model)
+        event_date = pending.event_time.astimezone(SHANGHAI).date()
+        add_period_usage(self.periods, key, pending.total_tokens, event_date)
+        add_period_usage(self.call_periods, key, 1, event_date)
+        cost_usd = usage_cost_usd(
+            model,
+            pending.usage,
+            source="codex",
+            prices=self.prices,
+            context_window=pending.context_window,
+        )
+        if cost_usd is not None:
+            add_period_cost(self.cost_periods, key, cost_usd, event_date)
+        self.last_event = (
+            max(self.last_event, pending.event_time)
+            if self.last_event
+            else pending.event_time
+        )
+
+    def _flush_pending_usage(self) -> None:
+        for session_id in list(self.pending_usage):
+            model = self._resolve_session_model(session_id)
+            if not model:
+                continue
+            entries = self.pending_usage.pop(session_id)
+            for pending in entries:
+                self.pending_fingerprints.discard(pending.fingerprint)
+                if self._has_fingerprint(pending.fingerprint):
+                    continue
+                self.seen.add(pending.fingerprint)
+                self._add_resolved_usage(model, pending)
+                self.cache_dirty = True
 
     @staticmethod
     def _cache_key(path: Path) -> str:
@@ -735,27 +1262,16 @@ class CodexTailTracker:
             ).date()
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
             version = int(payload.get("version") or 0)
-            if version not in (2, 3, CODEX_CACHE_VERSION):
+            if version != CODEX_CACHE_VERSION:
                 return
             files = payload.get("files") or {}
             if not isinstance(files, dict):
                 return
-            if version == 2:
-                fingerprints = payload.get("fingerprints") or []
-                if not isinstance(fingerprints, list):
-                    return
-                legacy_seen = {
-                    bytes.fromhex(value)
-                    for value in fingerprints
-                    if isinstance(value, str) and len(value) == 32
-                }
-                self.seen_packed = b"".join(sorted(legacy_seen))
-            else:
-                encoded = str(payload.get("fingerprints_b64") or "")
-                packed = base64.b64decode(encoded.encode("ascii")) if encoded else b""
-                if len(packed) % 16:
-                    raise ValueError("invalid packed Codex fingerprints")
-                self.seen_packed = packed
+            encoded = str(payload.get("fingerprints_b64") or "")
+            packed = base64.b64decode(encoded.encode("ascii")) if encoded else b""
+            if len(packed) % 16:
+                raise ValueError("invalid packed Codex fingerprints")
+            self.seen_packed = packed
             self.cached_files = {
                 str(key): value
                 for key, value in files.items()
@@ -768,6 +1284,9 @@ class CodexTailTracker:
                 self.call_periods = ClaudeTailTracker._decode_periods(
                     payload.get("call_periods")
                 )
+                self.cost_periods = ClaudeTailTracker._decode_periods(
+                    payload.get("cost_periods"), float
+                )
                 cached_date = cached_period_date(payload, cache_date)
                 current_date = datetime.now(SHANGHAI).date()
                 reset = rollover_periods(
@@ -777,6 +1296,11 @@ class CodexTailTracker:
                 )
                 rollover_periods(
                     self.call_periods,
+                    cached_date,
+                    current_date,
+                )
+                rollover_periods(
+                    self.cost_periods,
                     cached_date,
                     current_date,
                 )
@@ -791,8 +1315,6 @@ class CodexTailTracker:
             else:
                 self.seen_packed = b""
                 self.seen.clear()
-                self.cache_dirty = True
-            if version != CODEX_CACHE_VERSION:
                 self.cache_dirty = True
         except FileNotFoundError:
             return
@@ -814,6 +1336,9 @@ class CodexTailTracker:
             "files": self.cached_files,
             "periods": ClaudeTailTracker._encode_periods(self.periods),
             "call_periods": ClaudeTailTracker._encode_periods(self.call_periods),
+            "cost_periods": ClaudeTailTracker._encode_periods(
+                self.cost_periods, float
+            ),
             "last_event": self.last_event.isoformat() if self.last_event else None,
         }
         temporary_path = self.cache_path.with_suffix(".tmp")
@@ -877,6 +1402,7 @@ class CodexTailTracker:
             and cached_mtime_ns == stat.st_mtime_ns
             and cached_offset == stat.st_size
             and bool(record)
+            and self._known_model(str(record.get("model") or ""))
         )
         offset = cached_offset
         if offset < 0 or offset > stat.st_size:
@@ -895,6 +1421,7 @@ class CodexTailTracker:
             remainder=remainder,
             model=str(record.get("model") or "<unknown>"),
             session_id=str(record.get("session_id") or ""),
+            parent_session_id=str(record.get("parent_session_id") or ""),
             last_mtime=stat.st_mtime,
             last_size=stat.st_size if exact else offset,
             watching=not startup_cold,
@@ -913,6 +1440,7 @@ class CodexTailTracker:
             "mtime_ns": stat.st_mtime_ns,
             "offset": state.offset,
             "session_id": state.session_id,
+            "parent_session_id": state.parent_session_id,
             "model": state.model,
             "remainder": base64.b64encode(state.remainder).decode("ascii")
             if state.remainder
@@ -933,7 +1461,34 @@ class CodexTailTracker:
                 paths.append(path)
         return sorted(paths, key=lambda path: path.name)
 
+    def _prime_session_metadata(self, path: Path, state: CodexFileState) -> None:
+        """Read only session metadata so lineage is complete before token replay."""
+        try:
+            with path.open("rb") as handle:
+                for _ in range(30):
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        break
+                    try:
+                        event = json.loads(raw_line.decode("utf-8", errors="replace"))
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if event.get("type") != "session_meta":
+                        continue
+                    payload = event.get("payload") or {}
+                    state.session_id = str(payload.get("id") or state.session_id)
+                    state.parent_session_id = (
+                        codex_parent_session_id(payload) or state.parent_session_id
+                    )
+                    direct_model = str(payload.get("model") or "")
+                    if self._known_model(direct_model):
+                        state.model = direct_model
+                    break
+        except OSError:
+            self.errors += 1
+
     def _discover_startup(self) -> None:
+        entries = []
         for path in self._paths():
             try:
                 stat = path.stat()
@@ -947,6 +1502,16 @@ class CodexTailTracker:
                 startup_cold,
             )
             self.states[path] = state
+            entries.append((path, state, exact_cache_hit))
+
+        for path, state, exact_cache_hit in entries:
+            if not exact_cache_hit and not state.session_id:
+                self._prime_session_metadata(path, state)
+
+        for _path, state, _exact_cache_hit in entries:
+            self._register_state_model(state)
+
+        for path, state, exact_cache_hit in entries:
             if exact_cache_hit:
                 state.next_check = time.monotonic() + REFRESH_SECONDS
                 continue
@@ -1020,9 +1585,17 @@ class CodexTailTracker:
             payload = event.get("payload") or {}
             if event.get("type") == "session_meta":
                 state.session_id = str(payload.get("id") or state.session_id)
+                state.parent_session_id = (
+                    codex_parent_session_id(payload) or state.parent_session_id
+                )
+                direct_model = str(payload.get("model") or "")
+                if self._known_model(direct_model):
+                    state.model = direct_model
+                self._register_state_model(state)
                 continue
             if event.get("type") == "turn_context":
                 state.model = str(payload.get("model") or state.model)
+                self._register_state_model(state)
                 continue
             if event.get("type") != "event_msg" or payload.get("type") != "token_count":
                 continue
@@ -1037,41 +1610,48 @@ class CodexTailTracker:
                 )
             if total_tokens <= 0:
                 continue
-            model = state.model or "<unknown>"
             fingerprint = codex_fingerprint_digest(
                 codex_usage_fingerprint(
-                    state.session_id,
+                    self._resolve_lineage_root(state.session_id),
                     event.get("timestamp"),
                     info,
                 )
             )
-            if self._has_fingerprint(fingerprint):
+            if self._has_fingerprint(fingerprint) or fingerprint in self.pending_fingerprints:
                 continue
-            self.seen.add(fingerprint)
-            if len(self.seen) >= FINGERPRINT_COMPACT_THRESHOLD:
-                self._compact_fingerprints()
-            self.cache_dirty = True
             try:
                 event_time = parse_time(event.get("timestamp")).astimezone(timezone.utc)
             except (TypeError, ValueError):
                 self.errors += 1
                 continue
             if event_time <= self.since:
+                self.seen.add(fingerprint)
+                self.cache_dirty = True
                 continue
-            key = ("Codex", model)
-            add_period_usage(
-                self.periods,
-                key,
-                total_tokens,
-                event_time.astimezone(SHANGHAI).date(),
+            pending = CodexPendingUsage(
+                fingerprint=fingerprint,
+                session_id=state.session_id,
+                total_tokens=total_tokens,
+                usage=usage,
+                context_window=int(info.get("model_context_window") or 0),
+                event_time=event_time,
             )
-            add_period_usage(
-                self.call_periods,
-                key,
-                1,
-                event_time.astimezone(SHANGHAI).date(),
+            model = (
+                state.model
+                if self._known_model(state.model)
+                else self._resolve_session_model(state.session_id)
             )
-            self.last_event = max(self.last_event, event_time) if self.last_event else event_time
+            if not model:
+                self.pending_usage.setdefault(state.session_id, []).append(pending)
+                self.pending_fingerprints.add(fingerprint)
+                continue
+            state.model = model
+            self.session_models[state.session_id] = model
+            self.seen.add(fingerprint)
+            if len(self.seen) >= FINGERPRINT_COMPACT_THRESHOLD:
+                self._compact_fingerprints()
+            self.cache_dirty = True
+            self._add_resolved_usage(model, pending)
 
     def _read_path(
         self,
@@ -1094,6 +1674,7 @@ class CodexTailTracker:
                 state.remainder = b""
                 state.model = "<unknown>"
                 state.session_id = ""
+                state.parent_session_id = ""
             state.last_size = size
             state.last_mtime = mtime
             if size == state.offset:
@@ -1144,6 +1725,69 @@ class CodexTailTracker:
             self.watcher.close()
 
 
+def _claude_cached_periods(
+    projects_root: Path,
+    boundary: datetime,
+) -> dict[str, Counter]:
+    periods = empty_periods()
+    if not projects_root.exists():
+        return periods
+    now_date = datetime.now(SHANGHAI).date()
+    month_start = now_date.replace(day=1)
+    threshold = datetime.combine(
+        month_start,
+        datetime.min.time(),
+        tzinfo=SHANGHAI,
+    ).timestamp() - 5
+    messages: dict[tuple[str, str, str], tuple[datetime, int]] = {}
+    for path in projects_root.rglob("*.jsonl"):
+        try:
+            if path.stat().st_mtime < threshold:
+                continue
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    message = event.get("message") or {}
+                    usage = message.get("usage")
+                    if event.get("type") != "assistant" or not isinstance(usage, dict):
+                        continue
+                    model = str(message.get("model") or "<unknown>")
+                    if model == "<synthetic>":
+                        continue
+                    try:
+                        event_time = parse_time(event.get("timestamp")).astimezone(
+                            SHANGHAI
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if event_time >= boundary or event_time.date() < month_start:
+                        continue
+                    cached_tokens = int(
+                        usage.get("cache_read_input_tokens") or 0
+                    ) + int(usage.get("cache_creation_input_tokens") or 0)
+                    if cached_tokens <= 0:
+                        continue
+                    fingerprint = (
+                        str(event.get("sessionId") or path),
+                        str(message.get("id") or event.get("uuid") or "<unknown>"),
+                        model,
+                    )
+                    previous = messages.get(fingerprint)
+                    if previous is None or event_time >= previous[0]:
+                        messages[fingerprint] = (event_time, cached_tokens)
+        except OSError:
+            continue
+    for fingerprint, (event_time, cached_tokens) in messages.items():
+        key = ("Claude Code", fingerprint[2])
+        for period in active_periods(event_time.date(), now_date):
+            if period != "cumulative":
+                periods[period][key] += cached_tokens
+    return periods
+
+
 def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, datetime]:
     periods = empty_periods()
     if not stats_path.exists():
@@ -1153,21 +1797,32 @@ def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, date
         return periods, "Claude stats-cache 不存在", boundary
     stats = json.loads(stats_path.read_text(encoding="utf-8"))
     for model, usage in stats.get("modelUsage", {}).items():
-        periods["cumulative"][("Claude Code", model)] = int(usage.get("inputTokens") or 0) + int(
-            usage.get("outputTokens") or 0
+        periods["cumulative"][("Claude Code", model)] = (
+            int(usage.get("inputTokens") or 0)
+            + int(usage.get("outputTokens") or 0)
+            + int(usage.get("cacheReadInputTokens") or 0)
+            + int(usage.get("cacheCreationInputTokens") or 0)
         )
+    last_daily_date: date | None = None
     for row in stats.get("dailyModelTokens", []):
         try:
             row_date = date.fromisoformat(row["date"])
         except (KeyError, ValueError):
             continue
+        last_daily_date = max(last_daily_date, row_date) if last_daily_date else row_date
         for model, tokens in (row.get("tokensByModel") or {}).items():
             key = ("Claude Code", model)
             for period in active_periods(row_date):
                 if period != "cumulative":
                     periods[period][key] += int(tokens or 0)
     last_date_text = stats.get("lastComputedDate")
-    if last_date_text:
+    if last_daily_date is not None:
+        boundary = datetime.combine(
+            last_daily_date + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=SHANGHAI,
+        )
+    elif last_date_text:
         boundary = datetime.combine(
             date.fromisoformat(last_date_text) + timedelta(days=1),
             datetime.min.time(),
@@ -1177,9 +1832,12 @@ def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, date
         boundary = datetime.now(SHANGHAI).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
+    cached_periods = _claude_cached_periods(stats_path.parent / "projects", boundary)
+    for period in ("today", "week", "month"):
+        periods[period].update(cached_periods[period])
     return (
         periods,
-        f"Claude /status：{last_date_text or '未知日期'}",
+        f"Claude 含缓存：日数据至 {(last_daily_date.isoformat() if last_daily_date else last_date_text) or '未知日期'}",
         boundary,
     )
 
@@ -1236,11 +1894,14 @@ class ClaudeTailTracker:
         track_tokens: bool = True,
         watcher: DirectoryChangeWatcher | None = None,
         call_since: datetime | None = None,
+        cost_since: datetime | None = None,
         cache_path: Path | None = None,
+        prices: dict[str, dict[str, float]] | None = None,
     ):
         self.since = since.astimezone(timezone.utc)
         self.call_since = (call_since or since).astimezone(timezone.utc)
-        self.scan_since = min(self.since, self.call_since)
+        self.cost_since = (cost_since or since).astimezone(timezone.utc)
+        self.scan_since = min(self.since, self.call_since, self.cost_since)
         self.track_tokens = track_tokens
         self.root = Path.home() / ".claude" / "projects"
         self.cache_path = cache_path or (
@@ -1248,9 +1909,11 @@ class ClaudeTailTracker:
         )
         self._owns_watcher = watcher is None
         self.watcher = watcher or DirectoryChangeWatcher(self.root)
+        self.prices = prices or DEFAULT_PRICES
         self.states: dict[Path, ClaudeFileState] = {}
         self.periods = empty_periods()
         self.call_periods = empty_periods()
+        self.cost_periods = empty_periods()
         self.seen: set[tuple] = set()
         self.cached_files: dict[str, dict] = {}
         self.cache_dirty = False
@@ -1263,17 +1926,20 @@ class ClaudeTailTracker:
         self._save_cache()
 
     @staticmethod
-    def _encode_periods(periods: dict[str, Counter]) -> dict[str, list[dict]]:
+    def _encode_periods(
+        periods: dict[str, Counter],
+        coerce=int,
+    ) -> dict[str, list[dict]]:
         return {
             period: [
-                {"platform": key[0], "model": key[1], "value": int(value)}
+                {"platform": key[0], "model": key[1], "value": coerce(value)}
                 for key, value in sorted(periods[period].items())
             ]
             for period in PERIODS
         }
 
     @staticmethod
-    def _decode_periods(payload: object) -> dict[str, Counter]:
+    def _decode_periods(payload: object, coerce=int) -> dict[str, Counter]:
         periods = empty_periods()
         if not isinstance(payload, dict):
             return periods
@@ -1282,7 +1948,7 @@ class ClaudeTailTracker:
                 if not isinstance(row, dict):
                     continue
                 key = (str(row.get("platform") or "<unknown>"), str(row.get("model") or "<unknown>"))
-                periods[period][key] = int(row.get("value") or 0)
+                periods[period][key] = coerce(row.get("value") or 0)
         return periods
 
     def _load_cache(self) -> None:
@@ -1298,10 +1964,15 @@ class ClaudeTailTracker:
                 return
             if str(payload.get("call_since") or "") != self.call_since.isoformat():
                 return
+            if str(payload.get("cost_since") or "") != self.cost_since.isoformat():
+                return
             if bool(payload.get("track_tokens", True)) != self.track_tokens:
                 return
             self.periods = self._decode_periods(payload.get("periods"))
             self.call_periods = self._decode_periods(payload.get("call_periods"))
+            self.cost_periods = self._decode_periods(
+                payload.get("cost_periods"), float
+            )
             cached_date = cached_period_date(payload, cache_date)
             current_date = datetime.now(SHANGHAI).date()
             reset = rollover_periods(
@@ -1311,6 +1982,11 @@ class ClaudeTailTracker:
             )
             rollover_periods(
                 self.call_periods,
+                cached_date,
+                current_date,
+            )
+            rollover_periods(
+                self.cost_periods,
                 cached_date,
                 current_date,
             )
@@ -1338,10 +2014,12 @@ class ClaudeTailTracker:
             "version": CLAUDE_CACHE_VERSION,
             "token_since": self.since.isoformat(),
             "call_since": self.call_since.isoformat(),
+            "cost_since": self.cost_since.isoformat(),
             "track_tokens": self.track_tokens,
             "period_date": datetime.now(SHANGHAI).date().isoformat(),
             "periods": self._encode_periods(self.periods),
             "call_periods": self._encode_periods(self.call_periods),
+            "cost_periods": self._encode_periods(self.cost_periods, float),
             "seen": [list(row) for row in sorted(self.seen)],
             "last_event": self.last_event.isoformat() if self.last_event else None,
             "files": self.cached_files,
@@ -1495,8 +2173,11 @@ class ClaudeTailTracker:
                 continue
             if event_time < self.scan_since:
                 continue
-            total_tokens = int(usage.get("input_tokens") or 0) + int(
-                usage.get("output_tokens") or 0
+            total_tokens = (
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("output_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
             )
             fingerprint = (
                 str(event.get("sessionId") or "<unknown>"),
@@ -1512,6 +2193,25 @@ class ClaudeTailTracker:
                 add_period_usage(self.periods, key, total_tokens, event_date)
             if event_time >= self.call_since:
                 add_period_usage(self.call_periods, key, 1, event_date)
+            model_cost_since = (
+                self.since
+                if model.startswith(("claude-", "deepseek-"))
+                else self.cost_since
+            )
+            if event_time >= model_cost_since:
+                cost_usd = usage_cost_usd(
+                    model,
+                    usage,
+                    source="claude",
+                    prices=self.prices,
+                )
+                if cost_usd is not None:
+                    add_period_cost(
+                        self.cost_periods,
+                        key,
+                        cost_usd,
+                        event_date,
+                    )
             self.last_event = max(self.last_event, event_time) if self.last_event else event_time
             self.cache_dirty = True
 
@@ -1756,6 +2456,16 @@ class ClinePoller:
             )
             for period in PERIODS
         }
+        self.baseline_cost_periods = {
+            period: Counter(
+                {
+                    key: value
+                    for key, value in baseline.cost_periods[period].items()
+                    if key[0] == "Cline"
+                }
+            )
+            for period in PERIODS
+        }
         self.report_time = baseline.refreshed_at.astimezone(SHANGHAI)
         self.task_cache = ClineTaskCache()
         self.initial_tasks = self.task_cache.read(force=True)
@@ -1775,6 +2485,10 @@ class ClinePoller:
         self.call_periods = {
             period: Counter(values)
             for period, values in self.baseline_call_periods.items()
+        }
+        self.cost_periods = {
+            period: Counter(values)
+            for period, values in self.baseline_cost_periods.items()
         }
         self.status = "Cline taskHistory 已载入"
         self.poll()
@@ -1835,8 +2549,14 @@ class ClinePoller:
             previous_date,
             current_date,
         )
+        rollover_periods(
+            self.baseline_cost_periods,
+            previous_date,
+            current_date,
+        )
         rollover_periods(self.periods, previous_date, current_date)
         rollover_periods(self.call_periods, previous_date, current_date)
+        rollover_periods(self.cost_periods, previous_date, current_date)
         self.request_counter.roll_periods(previous_date, current_date)
         current_tasks = self.task_cache.read(force=True)
         current_by_model = Counter()
@@ -1887,6 +2607,10 @@ class DeepSeekApiPoller:
 SELECT
     model,
     to_char(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD'),
+    COALESCE(SUM(input_tokens), 0),
+    COALESCE(SUM(output_tokens), 0),
+    COALESCE(SUM(cache_creation_tokens), 0),
+    COALESCE(SUM(cache_read_tokens), 0),
     COALESCE(SUM(
         input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
     ), 0),
@@ -1907,12 +2631,15 @@ ORDER BY MAX(created_at);
         config_path: Path | None = None,
         psql_path: Path | None = None,
         runner=None,
+        prices: dict[str, dict[str, float]] | None = None,
     ):
         self.config_path = config_path or SUB2API_CONFIG
         self.psql_path = psql_path or SUB2API_PSQL
         self.runner = runner or subprocess.run
+        self.prices = prices or DEFAULT_PRICES
         self.periods = empty_periods()
         self.call_periods = empty_periods()
+        self.cost_periods = empty_periods()
         self.status = "DeepSeek API 正在载入"
         self.last_event: datetime | None = None
         self.next_check = 0.0
@@ -1941,15 +2668,26 @@ ORDER BY MAX(created_at);
     def _replace_usage(self, output: str) -> None:
         periods = empty_periods()
         call_periods = empty_periods()
+        cost_periods = empty_periods()
         latest: datetime | None = None
         total_calls = 0
         for line in output.splitlines():
             if not line.strip():
                 continue
-            fields = line.split("\t", 4)
-            if len(fields) != 5:
+            fields = line.split("\t", 8)
+            if len(fields) != 9:
                 raise ValueError("unexpected sub2api query output")
-            model, day_text, token_text, call_text, latest_text = fields
+            (
+                model,
+                day_text,
+                input_text,
+                output_text,
+                cache_write_text,
+                cache_read_text,
+                token_text,
+                call_text,
+                latest_text,
+            ) = fields
             if not model.lower().startswith("deepseek"):
                 continue
             event_date = date.fromisoformat(day_text)
@@ -1958,12 +2696,26 @@ ORDER BY MAX(created_at);
             key = ("DeepSeek API", model)
             add_period_usage(periods, key, tokens, event_date)
             add_period_usage(call_periods, key, calls, event_date)
+            cost_usd = usage_cost_usd(
+                model,
+                {
+                    "input_tokens": int(input_text),
+                    "output_tokens": int(output_text),
+                    "cache_creation_input_tokens": int(cache_write_text),
+                    "cache_read_input_tokens": int(cache_read_text),
+                },
+                source="claude",
+                prices=self.prices,
+            )
+            if cost_usd is not None:
+                add_period_cost(cost_periods, key, cost_usd, event_date)
             total_calls += calls
             row_latest = parse_time(latest_text)
             if latest is None or row_latest > latest:
                 latest = row_latest
         self.periods = periods
         self.call_periods = call_periods
+        self.cost_periods = cost_periods
         self.last_event = latest
         latest_label = (
             latest.astimezone(SHANGHAI).strftime("%m-%d %H:%M:%S")
@@ -2006,6 +2758,7 @@ ORDER BY MAX(created_at);
     def roll_periods(self, previous_date: date, current_date: date) -> None:
         rollover_periods(self.periods, previous_date, current_date)
         rollover_periods(self.call_periods, previous_date, current_date)
+        rollover_periods(self.cost_periods, previous_date, current_date)
         self.next_check = 0.0
 
 
@@ -2016,24 +2769,33 @@ class UsageSnapshot:
     updated_at: datetime
     report_time: datetime
     source_status: tuple[str, ...]
+    cost_periods: dict[str, dict[tuple[str, str], float]] = field(
+        default_factory=lambda: {period: {} for period in PERIODS}
+    )
     error: str = ""
 
-    def top(self, period: str) -> list[tuple[tuple[str, str], int]]:
+    def top(
+        self,
+        period: str,
+        limit: int = DEFAULT_ROW_COUNT,
+    ) -> list[tuple[tuple[str, str], int]]:
         values = self.periods.get(period, {})
-        return sorted(values.items(), key=lambda item: item[1], reverse=True)[:3]
+        return sorted(values.items(), key=lambda item: item[1], reverse=True)[
+            : max(0, int(limit))
+        ]
 
     def call_count(self, period: str) -> int:
         return sum(self.call_periods.get(period, {}).values())
 
 
 def usage_snapshot_signature(snapshot: UsageSnapshot) -> tuple:
-    def normalized(values: dict[str, dict[tuple[str, str], int]]) -> tuple:
+    def normalized(values, coerce) -> tuple:
         return tuple(
             (
                 period,
                 tuple(
                     sorted(
-                        (platform, model, int(value))
+                        (platform, model, coerce(value))
                         for (platform, model), value in values.get(period, {}).items()
                     )
                 ),
@@ -2042,20 +2804,21 @@ def usage_snapshot_signature(snapshot: UsageSnapshot) -> tuple:
         )
 
     return (
-        normalized(snapshot.periods),
-        normalized(snapshot.call_periods),
+        normalized(snapshot.periods, int),
+        normalized(snapshot.call_periods, int),
+        normalized(snapshot.cost_periods, float),
         snapshot.report_time.isoformat(),
     )
 
 
 def usage_snapshot_to_json(snapshot: UsageSnapshot) -> dict:
-    def encode(values: dict[str, dict[tuple[str, str], int]]) -> dict[str, list[dict]]:
+    def encode(values, coerce) -> dict[str, list[dict]]:
         return {
             period: [
                 {
                     "platform": platform,
                     "model": model,
-                    "value": int(value),
+                    "value": coerce(value),
                 }
                 for (platform, model), value in sorted(values.get(period, {}).items())
             ]
@@ -2063,8 +2826,9 @@ def usage_snapshot_to_json(snapshot: UsageSnapshot) -> dict:
         }
 
     return {
-        "periods": encode(snapshot.periods),
-        "call_periods": encode(snapshot.call_periods),
+        "periods": encode(snapshot.periods, int),
+        "call_periods": encode(snapshot.call_periods, int),
+        "cost_periods": encode(snapshot.cost_periods, float),
         "updated_at": snapshot.updated_at.isoformat(),
         "report_time": snapshot.report_time.isoformat(),
         "source_status": list(snapshot.source_status),
@@ -2072,18 +2836,19 @@ def usage_snapshot_to_json(snapshot: UsageSnapshot) -> dict:
 
 
 def usage_snapshot_from_json(payload: dict) -> UsageSnapshot:
-    def decode(name: str) -> dict[str, dict[tuple[str, str], int]]:
+    def decode(name: str, coerce) -> dict:
         decoded = {period: {} for period in PERIODS}
         source = payload.get(name) or {}
         for period in PERIODS:
             for row in source.get(period) or []:
                 key = (str(row["platform"]), str(row["model"]))
-                decoded[period][key] = int(row["value"])
+                decoded[period][key] = coerce(row["value"])
         return decoded
 
     return UsageSnapshot(
-        periods=decode("periods"),
-        call_periods=decode("call_periods"),
+        periods=decode("periods", int),
+        call_periods=decode("call_periods", int),
+        cost_periods=decode("cost_periods", float),
         updated_at=parse_time(payload.get("updated_at")),
         report_time=parse_time(payload.get("report_time")),
         source_status=tuple(str(value) for value in payload.get("source_status") or ()),
@@ -2097,6 +2862,7 @@ class UsageEngine:
         snapshot_cache_path: Path | None = None,
     ):
         self.report_dir = report_dir or find_report_dir()
+        self.prices = load_pricing(self.report_dir)
         self.snapshot_cache_path = snapshot_cache_path or (
             Path.home() / ".tokenwatcher" / "usage_snapshot_cache.json"
         )
@@ -2140,6 +2906,11 @@ class UsageEngine:
             snapshot_date,
             self.period_date,
         )
+        rollover_periods(
+            snapshot.cost_periods,
+            snapshot_date,
+            self.period_date,
+        )
         self.snapshot = snapshot
         self.snapshot_cache_signature = usage_snapshot_signature(snapshot)
 
@@ -2156,6 +2927,9 @@ class UsageEngine:
             },
             call_periods={
                 period: dict(baseline.call_periods[period]) for period in PERIODS
+            },
+            cost_periods={
+                period: dict(baseline.cost_periods[period]) for period in PERIODS
             },
             updated_at=baseline.refreshed_at.astimezone(SHANGHAI),
             report_time=baseline.refreshed_at.astimezone(SHANGHAI),
@@ -2203,17 +2977,23 @@ class UsageEngine:
 
     def _reload(self) -> None:
         baseline = load_baseline(self.report_dir)
+        self.prices = load_pricing(self.report_dir)
         self._close_trackers()
         self.baseline = baseline
-        self.codex = CodexTailTracker(self.baseline.refreshed_at)
+        self.codex = CodexTailTracker(
+            self.baseline.refreshed_at,
+            prices=self.prices,
+        )
         _, _, claude_boundary = self.claude_usage.read()
         self.claude = ClaudeTailTracker(
             claude_boundary,
             call_since=self.baseline.refreshed_at,
+            cost_since=self.baseline.refreshed_at,
+            prices=self.prices,
         )
         self.claude_boundary = claude_boundary
         self.cline = ClinePoller(self.baseline)
-        self.deepseek_api = DeepSeekApiPoller()
+        self.deepseek_api = DeepSeekApiPoller(prices=self.prices)
 
     def _roll_periods_if_needed(self, current_date: date) -> None:
         if current_date <= self.period_date:
@@ -2230,6 +3010,11 @@ class UsageEngine:
                 previous_date,
                 current_date,
             )
+            rollover_periods(
+                self.baseline.cost_periods,
+                previous_date,
+                current_date,
+            )
         for tracker in (self.codex, self.claude):
             if tracker is None:
                 continue
@@ -2240,6 +3025,11 @@ class UsageEngine:
             )
             rollover_periods(
                 tracker.call_periods,
+                previous_date,
+                current_date,
+            )
+            rollover_periods(
+                tracker.cost_periods,
                 previous_date,
                 current_date,
             )
@@ -2257,6 +3047,11 @@ class UsageEngine:
             )
             rollover_periods(
                 snapshot.call_periods,
+                previous_date,
+                current_date,
+            )
+            rollover_periods(
+                snapshot.cost_periods,
                 previous_date,
                 current_date,
             )
@@ -2295,11 +3090,14 @@ class UsageEngine:
                 self.claude = ClaudeTailTracker(
                     claude_boundary,
                     call_since=self.baseline.refreshed_at,
+                    cost_since=self.baseline.refreshed_at,
+                    prices=self.prices,
                 )
                 self.claude_boundary = claude_boundary
             self.claude.poll()
             combined_periods = {}
             combined_call_periods = {}
+            combined_cost_periods = {}
             for period in PERIODS:
                 values = Counter(self.baseline.periods[period])
                 values.update(self.codex.periods[period])
@@ -2323,6 +3121,16 @@ class UsageEngine:
                     del calls[key]
                 calls.update(self.deepseek_api.call_periods[period])
                 combined_call_periods[period] = dict(calls)
+                costs = Counter(self.baseline.cost_periods[period])
+                costs.update(self.codex.cost_periods[period])
+                costs.update(self.claude.cost_periods[period])
+                for key in [key for key in costs if key[0] == "Cline"]:
+                    del costs[key]
+                costs.update(self.cline.cost_periods[period])
+                for key in [key for key in costs if key[0] == "DeepSeek API"]:
+                    del costs[key]
+                costs.update(self.deepseek_api.cost_periods[period])
+                combined_cost_periods[period] = dict(costs)
             last_event = (
                 self.codex.last_event.astimezone(SHANGHAI).strftime("%H:%M:%S")
                 if self.codex.last_event
@@ -2336,6 +3144,7 @@ class UsageEngine:
             snapshot = UsageSnapshot(
                 periods=combined_periods,
                 call_periods=combined_call_periods,
+                cost_periods=combined_cost_periods,
                 updated_at=datetime.now(SHANGHAI),
                 report_time=self.baseline.refreshed_at.astimezone(SHANGHAI),
                 source_status=(
@@ -2350,6 +3159,9 @@ class UsageEngine:
             snapshot = UsageSnapshot(
                 periods=previous.periods if previous else {period: {} for period in PERIODS},
                 call_periods=previous.call_periods
+                if previous
+                else {period: {} for period in PERIODS},
+                cost_periods=previous.cost_periods
                 if previous
                 else {period: {} for period in PERIODS},
                 updated_at=datetime.now(SHANGHAI),
@@ -2396,8 +3208,13 @@ class FloatingRankRow:
     def __init__(self, parent: tk.Widget, rank: int, transparent: str):
         self.frame = tk.Frame(parent, bg=transparent)
         self.frame.pack(fill="x", pady=1)
-        self.frame.grid_columnconfigure(4, minsize=DELTA_COLUMN_WIDTH)
-        self.frame.grid_columnconfigure(5, minsize=TOKEN_COLUMN_WIDTH, weight=1)
+        self.frame.grid_columnconfigure(
+            0,
+            minsize=RANK_COLUMN_WIDTH + 2 + RANK_LEFT_SHIFT,
+        )
+        self.frame.grid_columnconfigure(1, minsize=MODEL_COLUMN_WIDTH + 3)
+        self.frame.grid_columnconfigure(4, minsize=TOKEN_COLUMN_WIDTH)
+        self.frame.grid_columnconfigure(5, minsize=COST_COLUMN_WIDTH, weight=1)
         self.rank_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
@@ -2411,43 +3228,34 @@ class FloatingRankRow:
             self.rank_canvas,
             text=str(rank),
             font_name=CASCADIA_MONO_FONT,
-            font_size=TITLE_FONT_SIZE,
+            font_size=BODY_FONT_SIZE,
             position=(2, ROW_MIDDLE),
             anchor="lm",
         )
-        self.platform_canvas = tk.Canvas(
+        self.model_badge_canvas = tk.Canvas(
             self.frame,
             bg="#4C8DFF",
-            width=PLATFORM_COLUMN_WIDTH,
+            width=MODEL_COLUMN_WIDTH + MODEL_CALL_LEFT_SHIFT,
             height=44,
             highlightthickness=0,
             borderwidth=0,
         )
-        self.platform_canvas.grid(row=0, column=1, sticky="w")
-        self.platform_text_id = self.platform_canvas.create_text(
-            PLATFORM_COLUMN_WIDTH // 2,
+        self.model_badge_canvas.place(
+            x=(
+                RANK_COLUMN_WIDTH
+                + 2
+                + RANK_LEFT_SHIFT
+                - MODEL_CALL_LEFT_SHIFT
+            ),
+            y=(ROW_HEIGHT - 44) // 2,
+        )
+        self.model_badge_text_id = self.model_badge_canvas.create_text(
+            (MODEL_COLUMN_WIDTH + MODEL_CALL_LEFT_SHIFT) // 2,
             22,
-            text="平台",
-            font=("Microsoft YaHei UI", -PLATFORM_BADGE_FONT_SIZE, "bold"),
+            text="等待数据",
+            font=("Microsoft YaHei UI", -MODEL_BADGE_FONT_SIZE, "bold"),
             fill="#FFFFFF",
             anchor="center",
-        )
-        self.model_canvas = tk.Canvas(
-            self.frame,
-            bg=transparent,
-            width=MODEL_COLUMN_WIDTH,
-            height=ROW_HEIGHT,
-            highlightthickness=0,
-            borderwidth=0,
-        )
-        self.model_canvas.grid(row=0, column=2, sticky="w", padx=(4, 3))
-        self.model_text = AdaptiveCanvasText(
-            self.model_canvas,
-            text="等待数据",
-            font_name=YAHEI_BOLD_FONT,
-            font_size=BODY_FONT_SIZE,
-            position=(2, ROW_MIDDLE),
-            anchor="lm",
         )
         self.call_canvas = tk.Canvas(
             self.frame,
@@ -2457,7 +3265,12 @@ class FloatingRankRow:
             highlightthickness=0,
             borderwidth=0,
         )
-        self.call_canvas.grid(row=0, column=3, sticky="w", padx=(0, 3))
+        self.call_canvas.grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=(0, VALUE_COLUMN_GAP + MODEL_CALL_LEFT_SHIFT),
+        )
         self.call_text = AdaptiveCanvasText(
             self.call_canvas,
             text="0",
@@ -2474,17 +3287,21 @@ class FloatingRankRow:
             highlightthickness=0,
             borderwidth=0,
         )
-        self.delta_canvas.grid(row=0, column=4, sticky="e", padx=(0, 4))
+        self.delta_canvas.grid(
+            row=0,
+            column=3,
+            sticky="e",
+            padx=(0, VALUE_COLUMN_GAP),
+        )
         self.delta_text = AdaptiveCanvasText(
             self.delta_canvas,
             text="",
             font_name=CASCADIA_MONO_FONT,
-            font_size=BODY_FONT_SIZE,
+            font_size=DELTA_FONT_SIZE,
             position=(DELTA_COLUMN_WIDTH - 2, ROW_MIDDLE),
             anchor="rm",
         )
         self.delta_text.solid_color = "#20D878"
-
         self.token_canvas = tk.Canvas(
             self.frame,
             bg=transparent,
@@ -2493,7 +3310,12 @@ class FloatingRankRow:
             highlightthickness=0,
             borderwidth=0,
         )
-        self.token_canvas.grid(row=0, column=5, sticky="e")
+        self.token_canvas.grid(
+            row=0,
+            column=4,
+            sticky="e",
+            padx=(0, VALUE_COLUMN_GAP),
+        )
         self.token_text = AdaptiveCanvasText(
             self.token_canvas,
             text="0",
@@ -2502,18 +3324,39 @@ class FloatingRankRow:
             position=(TOKEN_COLUMN_WIDTH - 2, ROW_MIDDLE),
             anchor="rm",
         )
+        self.cost_canvas = tk.Canvas(
+            self.frame,
+            bg=transparent,
+            width=COST_COLUMN_WIDTH,
+            height=ROW_HEIGHT,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.cost_canvas.grid(row=0, column=5, sticky="e")
+        self.cost_text = AdaptiveCanvasText(
+            self.cost_canvas,
+            text="$0.00",
+            font_name=CASCADIA_MONO_FONT,
+            font_size=COST_FONT_SIZE,
+            position=(COST_COLUMN_WIDTH - 2, ROW_MIDDLE),
+            anchor="rm",
+        )
         self.delta_hide_job = None
         self.call_color_job = None
         self.call_animation_jobs = []
         self.call_incoming_text = None
         self.call_value = 0
         self.call_foreground = None
-        self.model_foreground = None
         self.token_color_job = None
         self.token_animation_jobs = []
         self.token_incoming_text = None
         self.token_value = 0
         self.token_foreground = None
+        self.cost_color_job = None
+        self.cost_animation_jobs = []
+        self.cost_incoming_text = None
+        self.cost_value: float | None = None
+        self.cost_foreground = None
         self.current_key: tuple[str, str] | None = None
 
     def update(
@@ -2523,20 +3366,21 @@ class FloatingRankRow:
         delta: int,
         call_value: int,
         call_delta: int,
+        cost_value: float,
+        cost_delta: float,
     ) -> None:
         platform, model = key if key else ("—", "暂无数据")
         key_changed = key != self.current_key
         if key_changed and delta <= 0:
             self._clear_delta()
         self.current_key = key
-        display_platform = "Claude" if platform == "Claude Code" else platform
-        self.platform_canvas.configure(
+        self.model_badge_canvas.configure(
             bg=PLATFORM_COLORS.get(platform, "#8B7CF6")
         )
-        self.platform_canvas.itemconfigure(
-            self.platform_text_id, text=display_platform
+        self.model_badge_canvas.itemconfigure(
+            self.model_badge_text_id,
+            text=compact_model_name(model),
         )
-        self.model_text.set_text(compact_model_name(model))
         self._update_token_value(
             value,
             animate=not key_changed and delta > 0,
@@ -2547,6 +3391,12 @@ class FloatingRankRow:
             call_value,
             animate=not key_changed and call_delta > 0,
             foreground=self.call_foreground,
+            force=key_changed,
+        )
+        self._update_cost_value(
+            cost_value,
+            animate=not key_changed and cost_delta > 0,
+            foreground=self.cost_foreground,
             force=key_changed,
         )
         if delta > 0:
@@ -2564,7 +3414,7 @@ class FloatingRankRow:
             canvas,
             text=text,
             font_name=CASCADIA_MONO_FONT,
-            font_size=BODY_FONT_SIZE,
+            font_size=reference.font_size,
             position=position,
             anchor=anchor,
         )
@@ -2606,8 +3456,6 @@ class FloatingRankRow:
             self.token_value = value
             self.token_text.solid_color = foreground
             self.token_text.set_text(format_tokens(value))
-            self.model_text.solid_color = self.model_foreground
-            self.model_text.render_cached()
             return
 
         incoming_text = self._create_incoming_text(
@@ -2618,8 +3466,6 @@ class FloatingRankRow:
             "rm",
         )
         self.token_incoming_text = incoming_text
-        self.model_text.solid_color = "#20D878"
-        self.model_text.render_cached()
         steps = 9
 
         def animate_step(step: int) -> None:
@@ -2653,8 +3499,6 @@ class FloatingRankRow:
             self.token_incoming_text = None
         self.token_text.solid_color = self.token_foreground
         self.token_text.set_text(format_tokens(self.token_value))
-        self.model_text.solid_color = self.model_foreground
-        self.model_text.render_cached()
         self.token_color_job = None
 
     def _cancel_call_animation(self) -> None:
@@ -2734,10 +3578,87 @@ class FloatingRankRow:
         self.call_text.set_text(format_tokens(self.call_value))
         self.call_color_job = None
 
+    def _cancel_cost_animation(self) -> None:
+        for job in self.cost_animation_jobs:
+            try:
+                self.frame.after_cancel(job)
+            except tk.TclError:
+                pass
+        self.cost_animation_jobs.clear()
+        if self.cost_incoming_text is not None:
+            self.cost_canvas.delete(self.cost_incoming_text.image_id)
+            self.cost_incoming_text = None
+        self.cost_canvas.coords(self.cost_text.image_id, 0, 0)
+        self.cost_text.render_cached()
+
+    def _update_cost_value(
+        self,
+        value: float | None,
+        animate: bool,
+        foreground: str | None,
+        force: bool = False,
+    ) -> None:
+        value = None if value is None else float(value)
+        self.cost_foreground = foreground
+        if value == self.cost_value and not force:
+            return
+        self._cancel_cost_animation()
+        if self.cost_color_job is not None:
+            self.frame.after_cancel(self.cost_color_job)
+            self.cost_color_job = None
+        if not animate:
+            self.cost_value = value
+            self.cost_text.solid_color = foreground
+            self.cost_text.set_text(format_cost(value))
+            return
+
+        incoming_text = self._create_incoming_text(
+            self.cost_canvas,
+            self.cost_text,
+            format_cost(value),
+            (COST_COLUMN_WIDTH - 2, ROW_MIDDLE),
+            "rm",
+        )
+        self.cost_incoming_text = incoming_text
+        steps = 9
+
+        def animate_step(step: int) -> None:
+            progress = step / steps
+            self.cost_canvas.coords(
+                self.cost_text.image_id, 0, -round(ROW_HEIGHT * progress)
+            )
+            self.cost_canvas.coords(
+                incoming_text.image_id,
+                0,
+                ROW_HEIGHT - round(ROW_HEIGHT * progress),
+            )
+            if step < steps:
+                job = self.frame.after(24, animate_step, step + 1)
+                self.cost_animation_jobs.append(job)
+                return
+            self.cost_canvas.coords(self.cost_text.image_id, 0, 0)
+            self.cost_canvas.delete(incoming_text.image_id)
+            self.cost_incoming_text = None
+            self.cost_value = value
+            self.cost_animation_jobs.clear()
+            self.cost_text.solid_color = "#20D878"
+            self.cost_text.set_text(format_cost(value))
+            self.cost_color_job = self.frame.after(1100, self._restore_cost_color)
+
+        animate_step(1)
+
+    def _restore_cost_color(self) -> None:
+        if self.cost_incoming_text is not None:
+            self.cost_canvas.delete(self.cost_incoming_text.image_id)
+            self.cost_incoming_text = None
+        self.cost_text.solid_color = self.cost_foreground
+        self.cost_text.set_text(format_cost(self.cost_value))
+        self.cost_color_job = None
+
     def _show_delta(self, delta: int) -> None:
         if self.delta_hide_job is not None:
             self.frame.after_cancel(self.delta_hide_job)
-        self.delta_text.set_text(f"+{delta:,}")
+        self.delta_text.set_text(f"+{int(delta):,}")
         self.delta_hide_job = self.frame.after(1600, self._clear_delta)
 
     def _clear_delta(self) -> None:
@@ -2748,10 +3669,15 @@ class FloatingRankRow:
         self.set_solid_color(foreground)
 
     def set_solid_color(self, color: str | None) -> None:
-        self.model_foreground = color
         self.call_foreground = color
         self.token_foreground = color
-        for text in (self.rank_text, self.model_text, self.call_text, self.token_text):
+        self.cost_foreground = color
+        for text in (
+            self.rank_text,
+            self.call_text,
+            self.token_text,
+            self.cost_text,
+        ):
             text.solid_color = color
             text.render_cached()
         self.delta_text.solid_color = "#20D878"
@@ -2760,20 +3686,25 @@ class FloatingRankRow:
     def adaptive_texts(self) -> tuple[AdaptiveCanvasText, ...]:
         return (
             self.rank_text,
-            self.model_text,
             self.call_text,
             self.delta_text,
             self.token_text,
+            self.cost_text,
         )
 
 class LiveUsageApp:
     def __init__(self, engine: UsageEngine, screenshot_path: Path | None = None):
         self.engine = engine
+        self.ui_scale = apply_ui_scale(load_ui_scale())
+        self.row_count = load_row_count()
+        self.refresh_seconds = apply_refresh_seconds(load_refresh_seconds())
+        self.refresh_after_id: str | None = None
         self.period = "cumulative"
         self.transparent = "#010101"
         self.drag_origin: tuple[int, int] | None = None
         self.previous_values = {period: {} for period in PERIODS}
         self.previous_calls = {period: {} for period in PERIODS}
+        self.previous_costs = {period: {} for period in PERIODS}
         self.period_changed = False
         self.last_background_check = 0.0
         self.manual_foreground = False
@@ -2782,7 +3713,9 @@ class LiveUsageApp:
         self.root.title(APP_TITLE)
         self.root.overrideredirect(True)
         self.root.configure(bg=self.transparent)
-        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        self.root.geometry(
+            f"{WINDOW_WIDTH}x{window_height_for_rows(self.row_count)}"
+        )
         self.root.attributes("-topmost", True)
         if os.name == "nt":
             self.root.wm_attributes("-transparentcolor", self.transparent)
@@ -2800,7 +3733,7 @@ class LiveUsageApp:
         self.root.deiconify()
         self.root.lift()
         self.engine.start()
-        self.root.after(100, self._refresh_ui)
+        self._schedule_refresh(initial=True)
         if screenshot_path:
             self.root.after(3500, self._save_screenshot)
 
@@ -2821,7 +3754,7 @@ class LiveUsageApp:
         self.title_canvas.pack(side="left")
         self.title_text = AdaptiveCanvasText(
             self.title_canvas,
-            text="AI TOKEN TOP 3",
+            text=f"AI TOKEN TOP {self.row_count}",
             font_name=CASCADIA_MONO_FONT,
             font_size=TITLE_FONT_SIZE,
             position=(1, 20),
@@ -2875,7 +3808,7 @@ class LiveUsageApp:
         self.rows_container.pack(fill="x")
         self.cards = [
             FloatingRankRow(self.rows_container, rank, self.transparent)
-            for rank in (1, 2, 3)
+            for rank in range(1, self.row_count + 1)
         ]
         self.footer_frame = tk.Frame(self.shell, bg=self.transparent)
         self.footer_frame.pack(fill="x", pady=(2, 0))
@@ -2899,6 +3832,60 @@ class LiveUsageApp:
         )
         self.color_toggle_canvas.bind("<Button-1>", self._toggle_foreground)
         self.color_toggle_canvas.bind("<Button-3>", self._show_menu)
+        self.increase_column_canvas = tk.Canvas(
+            self.footer_frame,
+            bg=self.transparent,
+            width=FOOTER_CONTROL_WIDTH,
+            height=32,
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        self.increase_column_canvas.pack(side="left")
+        self.increase_column_text = AdaptiveCanvasText(
+            self.increase_column_canvas,
+            text="增加列",
+            font_name=YAHEI_FONT,
+            font_size=20,
+            position=(FOOTER_CONTROL_WIDTH // 2, 16),
+            anchor="mm",
+        )
+        self.increase_column_canvas.bind(
+            "<Button-1>",
+            lambda _event: self._change_row_count(1),
+        )
+        self.increase_column_canvas.bind("<Button-3>", self._show_menu)
+        self.increase_column_canvas.bind(
+            "<Control-MouseWheel>",
+            self._scale_with_wheel,
+        )
+        self.decrease_column_canvas = tk.Canvas(
+            self.footer_frame,
+            bg=self.transparent,
+            width=FOOTER_CONTROL_WIDTH,
+            height=32,
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        self.decrease_column_canvas.pack(side="left")
+        self.decrease_column_text = AdaptiveCanvasText(
+            self.decrease_column_canvas,
+            text="减少列",
+            font_name=YAHEI_FONT,
+            font_size=20,
+            position=(FOOTER_CONTROL_WIDTH // 2, 16),
+            anchor="mm",
+        )
+        self.decrease_column_canvas.bind(
+            "<Button-1>",
+            lambda _event: self._change_row_count(-1),
+        )
+        self.decrease_column_canvas.bind("<Button-3>", self._show_menu)
+        self.decrease_column_canvas.bind(
+            "<Control-MouseWheel>",
+            self._scale_with_wheel,
+        )
         self.footer_canvas = tk.Canvas(
             self.footer_frame,
             bg=self.transparent,
@@ -2910,7 +3897,7 @@ class LiveUsageApp:
         self.footer_canvas.pack(side="right")
         self.footer_text = AdaptiveCanvasText(
             self.footer_canvas,
-            text="0.5s",
+            text=f"{format_refresh_seconds(self.refresh_seconds)}s",
             font_name=YAHEI_FONT,
             font_size=20,
             position=(FOOTER_COLUMN_WIDTH - 2, 16),
@@ -2937,12 +3924,104 @@ class LiveUsageApp:
             )
         self.menu.add_command(label="打开完整报告", command=self._open_report)
         self.menu.add_separator()
+        self.menu.add_command(
+            label="增加列",
+            command=lambda: self._change_row_count(1),
+        )
+        self.menu.add_command(
+            label="减少列",
+            command=lambda: self._change_row_count(-1),
+        )
+        self.refresh_menu = tk.Menu(self.menu, tearoff=0)
+        self.refresh_interval_var = tk.DoubleVar(value=self.refresh_seconds)
+        for seconds in REFRESH_OPTIONS:
+            self.refresh_menu.add_radiobutton(
+                label=f"{format_refresh_seconds(seconds)} 秒",
+                variable=self.refresh_interval_var,
+                value=seconds,
+                command=lambda value=seconds: self._set_refresh_seconds(value),
+            )
+        self.menu.add_cascade(label="调整刷新时间", menu=self.refresh_menu)
+        self.menu.add_separator()
+        self.menu.add_command(label="缩小界面", command=lambda: self._change_scale(-UI_SCALE_STEP))
+        self.menu.add_command(label="放大界面", command=lambda: self._change_scale(UI_SCALE_STEP))
+        self.menu.add_command(label="恢复默认大小", command=self._reset_scale)
+        self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.close)
 
     def _bind_window_actions(self, widget: tk.Widget) -> None:
         widget.bind("<ButtonPress-1>", self._start_drag)
         widget.bind("<B1-Motion>", self._drag)
         widget.bind("<Button-3>", self._show_menu)
+        widget.bind("<Control-MouseWheel>", self._scale_with_wheel)
+
+    def _scale_with_wheel(self, event) -> str:
+        self._change_scale(UI_SCALE_STEP if event.delta > 0 else -UI_SCALE_STEP)
+        return "break"
+
+    def _change_scale(self, amount: float) -> None:
+        self._set_scale(self.ui_scale + amount)
+
+    def _reset_scale(self) -> None:
+        self._set_scale(DEFAULT_UI_SCALE)
+
+    def _set_scale(self, value: float) -> None:
+        value = round(min(MAX_UI_SCALE, max(MIN_UI_SCALE, value)), 2)
+        if value == self.ui_scale:
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        save_ui_scale(value)
+        self.ui_scale = apply_ui_scale(value)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.root.geometry(
+            f"{WINDOW_WIDTH}x{window_height_for_rows(self.row_count)}+{x}+{y}"
+        )
+        self._build()
+        self._update_period_styles()
+        self.manual_foreground = True
+        self._refresh_ui(schedule=False)
+        self.manual_foreground = False
+        self.root.update_idletasks()
+        self._apply_adaptive_foregrounds()
+
+    def _change_row_count(self, amount: int) -> None:
+        value = clamp_row_count(self.row_count + amount)
+        if value == self.row_count:
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        self.row_count = value
+        save_row_count(value)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self.root.geometry(
+            f"{WINDOW_WIDTH}x{window_height_for_rows(value)}+{x}+{y}"
+        )
+        self._build()
+        self._update_period_styles()
+        self.manual_foreground = True
+        self._refresh_ui(schedule=False)
+        self.manual_foreground = False
+        self.root.update_idletasks()
+        self._apply_adaptive_foregrounds()
+
+    def _set_refresh_seconds(self, value: float) -> None:
+        value = apply_refresh_seconds(value)
+        if value == self.refresh_seconds:
+            return
+        self.refresh_seconds = value
+        save_refresh_seconds(value)
+        self._refresh_ui(schedule=False)
+        self._schedule_refresh()
+
+    def _schedule_refresh(self, initial: bool = False) -> None:
+        if self.refresh_after_id is not None:
+            try:
+                self.root.after_cancel(self.refresh_after_id)
+            except tk.TclError:
+                pass
+        delay_ms = 100 if initial else max(50, round(self.refresh_seconds * 1000))
+        self.refresh_after_id = self.root.after(delay_ms, self._refresh_ui)
 
     def _position_top_right(self) -> None:
         self.root.update_idletasks()
@@ -3027,6 +4106,8 @@ class LiveUsageApp:
             self.live_text,
             *self.period_texts.values(),
             self.color_toggle_text,
+            self.increase_column_text,
+            self.decrease_column_text,
             self.footer_text,
         ]
         for card in self.cards:
@@ -3089,34 +4170,49 @@ class LiveUsageApp:
     def _refresh_ui(self, schedule: bool = True) -> None:
         snapshot = self.engine.get_snapshot()
         if snapshot:
-            top = snapshot.top(self.period)
+            top = snapshot.top(self.period, self.row_count)
             previous = self.previous_values[self.period]
             previous_calls = self.previous_calls[self.period]
+            previous_costs = self.previous_costs[self.period]
             for index, card in enumerate(self.cards):
                 if index < len(top):
                     key, value = top[index]
                     delta = value - previous.get(key, value)
                     call_value = snapshot.call_periods.get(self.period, {}).get(key, 0)
                     call_delta = call_value - previous_calls.get(key, call_value)
+                    cost_value = snapshot.cost_periods.get(self.period, {}).get(key)
+                    previous_cost = previous_costs.get(key)
+                    cost_delta = (
+                        cost_value - previous_cost
+                        if cost_value is not None and previous_cost is not None
+                        else 0.0
+                    )
                     card.update(
                         key,
                         value,
-                        delta,
+                        0 if self.period_changed else delta,
                         call_value,
                         0 if self.period_changed else call_delta,
+                        cost_value,
+                        0.0 if self.period_changed else cost_delta,
                     )
                 else:
-                    card.update(None, 0, 0, 0, 0)
+                    card.update(None, 0, 0, 0, 0, None, 0.0)
             for period in PERIODS:
                 self.previous_values[period] = dict(snapshot.periods.get(period, {}))
                 self.previous_calls[period] = dict(
                     snapshot.call_periods.get(period, {})
                 )
+                self.previous_costs[period] = dict(
+                    snapshot.cost_periods.get(period, {})
+                )
             self.period_changed = False
             top_total = sum(value for _, value in top)
             source_text = (
-                f"{PERIOD_LABELS[self.period]}前三 Σ {format_tokens(top_total)}  ·  "
-                f"{snapshot.updated_at.strftime('%H:%M:%S.%f')[:-3]}  ·  0.5 秒"
+                f"{PERIOD_LABELS[self.period]}前{row_count_label(self.row_count)} "
+                f"Σ {format_tokens(top_total)}  ·  "
+                f"{snapshot.updated_at.strftime('%H:%M:%S.%f')[:-3]}  ·  "
+                f"{format_refresh_seconds(self.refresh_seconds)} 秒"
             )
             if snapshot.error:
                 self.live_text.set_text("AUTO ×")
@@ -3130,7 +4226,7 @@ class LiveUsageApp:
                 self.last_background_check = time.monotonic()
                 self._apply_adaptive_foregrounds()
         if schedule:
-            self.root.after(500, self._refresh_ui)
+            self._schedule_refresh()
 
     def _save_screenshot(self) -> None:
         if not self.screenshot_path:
@@ -3168,10 +4264,10 @@ class LiveUsageApp:
         draw = ImageDraw.Draw(image)
         badge_font = _load_image_font(
             YAHEI_BOLD_FONT,
-            PLATFORM_BADGE_FONT_SIZE,
+            MODEL_BADGE_FONT_SIZE,
         )
         for card in self.cards:
-            canvas = card.platform_canvas
+            canvas = card.model_badge_canvas
             x = canvas.winfo_rootx() - self.root.winfo_rootx()
             y = canvas.winfo_rooty() - self.root.winfo_rooty()
             badge_width = canvas.winfo_width()
@@ -3182,7 +4278,7 @@ class LiveUsageApp:
             )
             draw.text(
                 (x + badge_width // 2, y + badge_height // 2),
-                str(canvas.itemcget(card.platform_text_id, "text")),
+                str(canvas.itemcget(card.model_badge_text_id, "text")),
                 font=badge_font,
                 fill="#FFFFFF",
                 anchor="mm",
@@ -3191,6 +4287,12 @@ class LiveUsageApp:
         return image.convert("RGB")
 
     def close(self) -> None:
+        if self.refresh_after_id is not None:
+            try:
+                self.root.after_cancel(self.refresh_after_id)
+            except tk.TclError:
+                pass
+            self.refresh_after_id = None
         self.engine.stop()
         self.root.destroy()
 
@@ -3206,6 +4308,7 @@ def snapshot_payload(snapshot: UsageSnapshot) -> dict:
                 "model": key[1],
                 "calls": snapshot.call_periods.get(period, {}).get(key, 0),
                 "total_tokens": value,
+                "estimated_cost_usd": snapshot.cost_periods.get(period, {}).get(key),
             }
             for key, value in snapshot.top(period)
         ]
@@ -3241,7 +4344,9 @@ def main() -> int:
             payload = snapshot_payload(snapshot)
             output = json.dumps(payload, ensure_ascii=False, indent=2)
             if args.snapshot_json and args.snapshot_json != "-":
-                Path(args.snapshot_json).write_text(output, encoding="utf-8")
+                output_path = Path(args.snapshot_json)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(output, encoding="utf-8")
             elif not getattr(sys, "frozen", False):
                 print(output)
             return 0 if not snapshot.error and len(snapshot.top("cumulative")) == 3 else 1

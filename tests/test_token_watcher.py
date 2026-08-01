@@ -10,7 +10,7 @@ import unittest
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "token_watcher.py"
@@ -115,7 +115,15 @@ class TokenWatcherTests(unittest.TestCase):
         ) + "\n"
 
     @staticmethod
-    def _claude_line(message_id: str, total: int, timestamp: datetime) -> str:
+    def _claude_line(
+        message_id: str,
+        total: int,
+        timestamp: datetime,
+        *,
+        cached: int = 0,
+        cache_created: int = 0,
+        output: int = 0,
+    ) -> str:
         return json.dumps(
             {
                 "type": "assistant",
@@ -124,13 +132,73 @@ class TokenWatcherTests(unittest.TestCase):
                 "message": {
                     "id": message_id,
                     "model": "claude-test",
-                    "usage": {"input_tokens": total, "output_tokens": 0},
+                    "usage": {
+                        "input_tokens": total,
+                        "cache_read_input_tokens": cached,
+                        "cache_creation_input_tokens": cache_created,
+                        "output_tokens": output,
+                    },
                 },
             }
         ) + "\n"
 
     def test_format_tokens_uses_exact_grouped_value(self) -> None:
         self.assertEqual(token_watcher.format_tokens(20_043_264_243), "20,043,264,243")
+
+    def test_format_cost_uses_usd_with_two_decimal_places(self) -> None:
+        self.assertEqual(token_watcher.format_cost(4863.511915), "$4,863.51")
+        self.assertEqual(token_watcher.format_cost(None), "—")
+
+    def test_live_usage_cost_uses_cache_and_long_context_prices(self) -> None:
+        short = token_watcher.usage_cost_usd(
+            "gpt-5.6-sol",
+            {
+                "input_tokens": 100_000,
+                "cached_input_tokens": 80_000,
+                "output_tokens": 1_000,
+            },
+            source="codex",
+            context_window=200_000,
+        )
+        long = token_watcher.usage_cost_usd(
+            "gpt-5.6-sol",
+            {
+                "input_tokens": 300_000,
+                "cached_input_tokens": 250_000,
+                "output_tokens": 2_000,
+            },
+            source="codex",
+            context_window=400_000,
+        )
+        opus = token_watcher.usage_cost_usd(
+            "claude-opus-4.8",
+            {
+                "input_tokens": 10_000,
+                "cache_read_input_tokens": 20_000,
+                "cache_creation_input_tokens": 2_000,
+                "output_tokens": 1_000,
+            },
+            source="claude",
+        )
+        terra = token_watcher.usage_cost_usd(
+            "gpt-5.6-terra",
+            {
+                "input_tokens": 100_000,
+                "cached_input_tokens": 80_000,
+                "output_tokens": 1_000,
+            },
+            source="codex",
+            context_window=200_000,
+        )
+        self.assertAlmostEqual(short, 0.17)
+        self.assertAlmostEqual(long, 0.84)
+        self.assertAlmostEqual(opus, 0.0975)
+        self.assertAlmostEqual(terra, 0.085)
+        self.assertIsNone(
+            token_watcher.usage_cost_usd(
+                "unpriced-model", {}, source="codex"
+            )
+        )
 
     def test_text_foreground_inverts_plain_light_and_dark_backgrounds(self) -> None:
         light = token_watcher.choose_text_foreground([(245, 245, 245)] * 20)
@@ -231,17 +299,54 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertIn("image.alpha_composite(text.last_image", source)
 
     def test_overlay_layout_uses_large_borderless_text(self) -> None:
-        self.assertEqual(token_watcher.WINDOW_WIDTH, 720)
+        self.assertEqual(token_watcher.WINDOW_WIDTH, 852)
         self.assertGreaterEqual(token_watcher.BODY_FONT_SIZE, 26)
         self.assertGreaterEqual(token_watcher.TITLE_FONT_SIZE, 28)
-        self.assertLess(
-            token_watcher.PLATFORM_BADGE_FONT_SIZE,
+        self.assertEqual(
+            token_watcher.MODEL_BADGE_FONT_SIZE,
             token_watcher.BODY_FONT_SIZE,
         )
+        self.assertEqual(token_watcher.DELTA_FONT_SIZE, token_watcher.BODY_FONT_SIZE)
+        self.assertEqual(token_watcher.COST_FONT_SIZE, token_watcher.BODY_FONT_SIZE)
+        self.assertEqual(token_watcher.VALUE_COLUMN_GAP, 20)
+        self.assertEqual(token_watcher.MODEL_CALL_LEFT_SHIFT, 16)
+        self.assertEqual(token_watcher.RANK_LEFT_SHIFT, 16)
+        self.assertEqual(token_watcher.DELTA_COLUMN_WIDTH, 132)
+        row_width = (
+            token_watcher.RANK_COLUMN_WIDTH
+            + 2
+            + token_watcher.RANK_LEFT_SHIFT
+            + token_watcher.MODEL_COLUMN_WIDTH
+            + 3
+            + token_watcher.CALL_COLUMN_WIDTH
+            + token_watcher.VALUE_COLUMN_GAP
+            + token_watcher.MODEL_CALL_LEFT_SHIFT
+            + token_watcher.DELTA_COLUMN_WIDTH
+            + token_watcher.VALUE_COLUMN_GAP
+            + token_watcher.TOKEN_COLUMN_WIDTH
+            + token_watcher.VALUE_COLUMN_GAP
+            + token_watcher.COST_COLUMN_WIDTH
+        )
+        self.assertLessEqual(row_width, token_watcher.WINDOW_WIDTH - 6)
         self.assertGreaterEqual(token_watcher.ROW_HEIGHT, 56)
         source = MODULE_PATH.read_text(encoding="utf-8")
-        self.assertIn('-PLATFORM_BADGE_FONT_SIZE, "bold"', source)
-        self.assertIn("PLATFORM_BADGE_FONT_SIZE,\n        )", source)
+        self.assertIn('-MODEL_BADGE_FONT_SIZE, "bold"', source)
+        self.assertIn("MODEL_BADGE_FONT_SIZE,\n        )", source)
+        self.assertNotIn("PLATFORM_COLUMN_WIDTH", source)
+        self.assertIn("self.model_badge_canvas", source)
+        self.assertIn(
+            "width=MODEL_COLUMN_WIDTH + MODEL_CALL_LEFT_SHIFT",
+            source,
+        )
+        self.assertIn("+ RANK_LEFT_SHIFT\n                - MODEL_CALL_LEFT_SHIFT", source)
+        self.assertIn(
+            "(MODEL_COLUMN_WIDTH + MODEL_CALL_LEFT_SHIFT) // 2",
+            source,
+        )
+        self.assertIn("VALUE_COLUMN_GAP + MODEL_CALL_LEFT_SHIFT", source)
+        self.assertIn("self.delta_canvas", source)
+        self.assertIn('self.delta_text.set_text(f"+{int(delta):,}")', source)
+        self.assertIn("self.cost_canvas", source)
         self.assertIn('self.root.overrideredirect(True)', source)
         self.assertIn('highlightthickness=0', source)
         self.assertIn('borderwidth=0', source)
@@ -251,15 +356,211 @@ class TokenWatcherTests(unittest.TestCase):
             token_watcher.re.fullmatch(r"\d+x\d+[+-]\d+[+-]\d+", "860x260+3270+1640")
         )
 
-    def test_growth_animation_and_delta_keep_green_accent(self) -> None:
+    def test_ui_scale_is_clamped_persisted_and_applied(self) -> None:
+        original_scale = token_watcher.WINDOW_WIDTH / token_watcher.BASE_UI_METRICS[
+            "WINDOW_WIDTH"
+        ]
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                settings_path = Path(temporary_directory) / "ui_settings.json"
+                token_watcher.save_ui_scale(1.15, settings_path)
+                self.assertEqual(token_watcher.load_ui_scale(settings_path), 1.15)
+                settings_path.write_text(
+                    json.dumps({"scale": 99}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    token_watcher.load_ui_scale(settings_path),
+                    token_watcher.MAX_UI_SCALE,
+                )
+            token_watcher.apply_ui_scale(0.8)
+            self.assertEqual(
+                token_watcher.WINDOW_WIDTH,
+                round(token_watcher.BASE_UI_METRICS["WINDOW_WIDTH"] * 0.8),
+            )
+            self.assertEqual(token_watcher.BODY_FONT_SIZE, 21)
+            source = MODULE_PATH.read_text(encoding="utf-8")
+            self.assertIn("<Control-MouseWheel>", source)
+            self.assertIn('label="缩小界面"', source)
+            self.assertIn('label="放大界面"', source)
+            self.assertIn('label="恢复默认大小"', source)
+        finally:
+            token_watcher.apply_ui_scale(original_scale)
+
+    def test_ui_settings_preserve_scale_row_count_and_refresh_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            settings_path = Path(temporary_directory) / "ui_settings.json"
+            self.assertEqual(
+                token_watcher.load_row_count(settings_path),
+                token_watcher.DEFAULT_ROW_COUNT,
+            )
+            token_watcher.save_ui_scale(1.15, settings_path)
+            token_watcher.save_row_count(5, settings_path)
+            token_watcher.save_refresh_seconds(0.1, settings_path)
+            self.assertEqual(token_watcher.load_ui_scale(settings_path), 1.15)
+            self.assertEqual(token_watcher.load_row_count(settings_path), 5)
+            self.assertEqual(
+                token_watcher.load_refresh_seconds(settings_path),
+                0.1,
+            )
+
+            token_watcher.save_row_count(999, settings_path)
+            self.assertEqual(
+                token_watcher.load_row_count(settings_path),
+                token_watcher.MAX_ROW_COUNT,
+            )
+            self.assertEqual(token_watcher.load_ui_scale(settings_path), 1.15)
+            self.assertEqual(token_watcher.load_refresh_seconds(settings_path), 0.1)
+            token_watcher.save_row_count(-999, settings_path)
+            self.assertEqual(
+                token_watcher.load_row_count(settings_path),
+                token_watcher.MIN_ROW_COUNT,
+            )
+
+            token_watcher.save_refresh_seconds(999, settings_path)
+            self.assertEqual(
+                token_watcher.load_refresh_seconds(settings_path),
+                token_watcher.MAX_REFRESH_SECONDS,
+            )
+            token_watcher.save_refresh_seconds(-999, settings_path)
+            self.assertEqual(
+                token_watcher.load_refresh_seconds(settings_path),
+                token_watcher.MIN_REFRESH_SECONDS,
+            )
+
+    def test_refresh_time_is_adjustable_and_shared_by_engine_and_ui(self) -> None:
+        original_refresh = token_watcher.REFRESH_SECONDS
+        try:
+            self.assertEqual(token_watcher.apply_refresh_seconds(0.25), 0.25)
+            self.assertEqual(token_watcher.REFRESH_SECONDS, 0.25)
+            self.assertEqual(token_watcher.format_refresh_seconds(0.25), "0.25")
+            source = MODULE_PATH.read_text(encoding="utf-8")
+            self.assertIn('label="增加列"', source)
+            self.assertIn('label="减少列"', source)
+            self.assertIn('label="调整刷新时间"', source)
+            self.assertIn("for seconds in REFRESH_OPTIONS", source)
+            self.assertIn("self.refresh_seconds * 1000", source)
+            self.assertNotIn("self.root.after(500, self._refresh_ui)", source)
+        finally:
+            token_watcher.apply_refresh_seconds(original_refresh)
+
+    def test_row_count_controls_drive_dynamic_layout(self) -> None:
+        original_scale = token_watcher.WINDOW_WIDTH / token_watcher.BASE_UI_METRICS[
+            "WINDOW_WIDTH"
+        ]
+        try:
+            token_watcher.apply_ui_scale(token_watcher.DEFAULT_UI_SCALE)
+            default_height = token_watcher.window_height_for_rows(
+                token_watcher.DEFAULT_ROW_COUNT
+            )
+            self.assertEqual(default_height, token_watcher.WINDOW_HEIGHT)
+            self.assertEqual(
+                token_watcher.window_height_for_rows(
+                    token_watcher.DEFAULT_ROW_COUNT + 2
+                ),
+                default_height + (2 * token_watcher.ROW_HEIGHT),
+            )
+            self.assertEqual(
+                token_watcher.window_height_for_rows(999),
+                default_height
+                + (
+                    token_watcher.MAX_ROW_COUNT
+                    - token_watcher.DEFAULT_ROW_COUNT
+                )
+                * token_watcher.ROW_HEIGHT,
+            )
+            self.assertEqual(token_watcher.row_count_label(3), "三")
+            self.assertEqual(token_watcher.row_count_label(10), "十")
+            source = MODULE_PATH.read_text(encoding="utf-8")
+            self.assertIn('text="增加列"', source)
+            self.assertIn('text="减少列"', source)
+            self.assertIn("self._change_row_count(1)", source)
+            self.assertIn("self._change_row_count(-1)", source)
+            self.assertIn(
+                "range(1, self.row_count + 1)",
+                source,
+            )
+        finally:
+            token_watcher.apply_ui_scale(original_scale)
+
+    def test_usage_snapshot_top_accepts_a_dynamic_limit(self) -> None:
+        now = datetime.now(timezone.utc)
+        periods = {period: {} for period in token_watcher.PERIODS}
+        periods["cumulative"] = {
+            ("Codex", f"model-{index}"): index for index in range(1, 7)
+        }
+        snapshot = token_watcher.UsageSnapshot(
+            periods=periods,
+            call_periods={period: {} for period in token_watcher.PERIODS},
+            updated_at=now,
+            report_time=now,
+            source_status=(),
+        )
+        self.assertEqual(len(snapshot.top("cumulative")), 3)
+        self.assertEqual(len(snapshot.top("cumulative", 5)), 5)
+        self.assertEqual(snapshot.top("cumulative", 1)[0][1], 6)
+
+    def test_growth_animations_keep_green_accent(self) -> None:
         source = MODULE_PATH.read_text(encoding="utf-8")
-        self.assertIn('self.delta_text.solid_color = "#20D878"', source)
         self.assertIn("def _create_incoming_text(", source)
-        self.assertIn("font_size=BODY_FONT_SIZE", source)
+        self.assertIn("font_size=reference.font_size", source)
+        self.assertNotIn("font_size: int = BODY_FONT_SIZE", source)
         self.assertNotIn('font=("Cascadia Mono", 11, "bold")', source)
         self.assertNotIn('font=("Cascadia Mono", 13, "bold")', source)
         self.assertIn('self.token_text.solid_color = "#20D878"', source)
         self.assertIn('self.call_text.solid_color = "#20D878"', source)
+        self.assertIn('self.cost_text.solid_color = "#20D878"', source)
+        self.assertIn('self.delta_text.solid_color = "#20D878"', source)
+
+    def test_incoming_animation_inherits_scaled_reference_font(self) -> None:
+        reference = Mock()
+        reference.font_size = 36
+        reference.last_background = None
+        reference.last_root = None
+        canvas = Mock()
+        with patch.object(
+            token_watcher,
+            "AdaptiveCanvasText",
+            autospec=True,
+        ) as text_class:
+            incoming = Mock()
+            incoming.image_id = 7
+            text_class.return_value = incoming
+            result = token_watcher.FloatingRankRow._create_incoming_text(
+                canvas,
+                reference,
+                "123",
+                (20, 10),
+                "rm",
+            )
+        self.assertIs(result, incoming)
+        self.assertEqual(text_class.call_args.kwargs["font_size"], 36)
+
+    def test_delta_column_fits_six_digit_increment(self) -> None:
+        from PIL import ImageFont
+
+        original_scale = token_watcher.WINDOW_WIDTH / token_watcher.BASE_UI_METRICS[
+            "WINDOW_WIDTH"
+        ]
+        try:
+            for scale in (
+                token_watcher.MIN_UI_SCALE,
+                token_watcher.DEFAULT_UI_SCALE,
+                1.05,
+                token_watcher.MAX_UI_SCALE,
+            ):
+                token_watcher.apply_ui_scale(scale)
+                font = ImageFont.truetype(
+                    token_watcher.CASCADIA_MONO_FONT,
+                    token_watcher.DELTA_FONT_SIZE,
+                )
+                left, _top, right, _bottom = font.getbbox("+999,999")
+                self.assertLessEqual(
+                    right - left,
+                    token_watcher.DELTA_COLUMN_WIDTH - 4,
+                )
+        finally:
+            token_watcher.apply_ui_scale(original_scale)
 
     def test_active_periods(self) -> None:
         now = date(2026, 7, 13)
@@ -297,8 +598,8 @@ class TokenWatcherTests(unittest.TestCase):
             yesterday = now.date() - timedelta(days=1)
             output = "\n".join(
                 (
-                    f"deepseek-v4-flash\t{now.date()}\t146\t3\t{now.isoformat()}",
-                    f"deepseek-v4-pro\t{yesterday}\t68\t1\t{(now - timedelta(days=1)).isoformat()}",
+                    f"deepseek-v4-flash\t{now.date()}\t100\t20\t10\t16\t146\t3\t{now.isoformat()}",
+                    f"deepseek-v4-pro\t{yesterday}\t50\t10\t3\t5\t68\t1\t{(now - timedelta(days=1)).isoformat()}",
                 )
             )
             captured = {}
@@ -322,6 +623,12 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(poller.periods["today"][flash_key], 146)
             self.assertEqual(poller.periods["cumulative"][pro_key], 68)
             self.assertEqual(poller.call_periods["today"][flash_key], 3)
+            expected_cost = (
+                50 * 0.435 + 10 * 0.87 + 3 * 0.435 + 5 * 0.003625
+            ) / 1_000_000
+            self.assertAlmostEqual(
+                poller.cost_periods["cumulative"][pro_key], expected_cost
+            )
             self.assertIn("4 次", poller.status)
             self.assertNotIn("secret-value", captured["command"])
             self.assertEqual(captured["env"]["PGPASSWORD"], "secret-value")
@@ -365,6 +672,29 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(baseline.report_mtime, 0.0)
             self.assertFalse(baseline.periods["cumulative"])
 
+    def test_baseline_loads_model_and_daily_costs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_dir = Path(temporary_directory)
+            now = datetime.now(token_watcher.SHANGHAI)
+            (report_dir / "summary.json").write_text(
+                json.dumps({"refreshed_at_shanghai": now.isoformat()}),
+                encoding="utf-8",
+            )
+            (report_dir / "model_cost.csv").write_text(
+                "platform,model,estimated_cost_usd\n"
+                "Codex,gpt-5.6-sol,12.5\n",
+                encoding="utf-8",
+            )
+            (report_dir / "daily_cost_by_platform_model.csv").write_text(
+                "date,platform,model,estimated_cost_usd\n"
+                f"{now.date()},Codex,gpt-5.6-sol,1.25\n",
+                encoding="utf-8",
+            )
+            baseline = token_watcher.load_baseline(report_dir)
+            key = ("Codex", "gpt-5.6-sol")
+            self.assertEqual(baseline.cost_periods["cumulative"][key], 12.5)
+            self.assertEqual(baseline.cost_periods["today"][key], 1.25)
+
     def test_report_lookup_walks_up_from_directory_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -388,11 +718,14 @@ class TokenWatcherTests(unittest.TestCase):
             now = datetime.now(timezone.utc)
             periods = {period: {} for period in token_watcher.PERIODS}
             call_periods = {period: {} for period in token_watcher.PERIODS}
+            cost_periods = {period: {} for period in token_watcher.PERIODS}
             periods["cumulative"][("Codex", "gpt-test")] = 123
             call_periods["cumulative"][("Codex", "gpt-test")] = 4
+            cost_periods["cumulative"][("Codex", "gpt-test")] = 12.34
             snapshot = token_watcher.UsageSnapshot(
                 periods=periods,
                 call_periods=call_periods,
+                cost_periods=cost_periods,
                 updated_at=now,
                 report_time=now,
                 source_status=("cached",),
@@ -419,6 +752,38 @@ class TokenWatcherTests(unittest.TestCase):
                 loaded.call_periods["cumulative"][("Codex", "gpt-test")],
                 4,
             )
+            self.assertEqual(
+                loaded.cost_periods["cumulative"][("Codex", "gpt-test")],
+                12.34,
+            )
+
+    def test_snapshot_json_creates_missing_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "nested" / "snapshot.json"
+            now = datetime.now(timezone.utc)
+            snapshot = token_watcher.UsageSnapshot(
+                periods={period: {} for period in token_watcher.PERIODS},
+                call_periods={period: {} for period in token_watcher.PERIODS},
+                cost_periods={period: {} for period in token_watcher.PERIODS},
+                updated_at=now,
+                report_time=now,
+                source_status=(),
+            )
+
+            class FakeEngine:
+                def refresh_once(self):
+                    return snapshot
+
+                def stop(self):
+                    return None
+
+            with patch.object(
+                token_watcher.sys,
+                "argv",
+                ["token_watcher.py", "--snapshot-json", str(output_path)],
+            ), patch.object(token_watcher, "UsageEngine", return_value=FakeEngine()):
+                self.assertEqual(token_watcher.main(), 1)
+            self.assertTrue(output_path.exists())
 
     def test_snapshot_cache_clears_today_after_shanghai_midnight(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -438,9 +803,13 @@ class TokenWatcherTests(unittest.TestCase):
             calls = {
                 period: {key: 4} for period in token_watcher.PERIODS
             }
+            costs = {
+                period: {key: 1.25} for period in token_watcher.PERIODS
+            }
             snapshot = token_watcher.UsageSnapshot(
                 periods=periods,
                 call_periods=calls,
+                cost_periods=costs,
                 updated_at=previous,
                 report_time=previous,
                 source_status=("cached",),
@@ -461,6 +830,7 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(loaded.periods["cumulative"][key], 123)
             self.assertFalse(loaded.periods["today"])
             self.assertFalse(loaded.call_periods["today"])
+            self.assertFalse(loaded.cost_periods["today"])
 
     def test_report_preview_is_available_when_snapshot_cache_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -714,6 +1084,139 @@ class TokenWatcherTests(unittest.TestCase):
                 tracker.call_periods["cumulative"][("Codex", "gpt-test")], 2
             )
 
+    def test_codex_subagent_replayed_parent_history_is_counted_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "08" / "01"
+            session_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            parent = session_dir / "a-parent.jsonl"
+            child = session_dir / "z-child.jsonl"
+            parent.write_text(
+                self._codex_lines(
+                    "parent-session",
+                    10,
+                    now,
+                    cumulative=10,
+                ),
+                encoding="utf-8",
+            )
+            child.write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": "child-session",
+                                    "parent_thread_id": "parent-session",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "timestamp": (now + timedelta(seconds=1)).isoformat(),
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "last_token_usage": {"total_tokens": 10},
+                                        "total_token_usage": {"total_tokens": 10},
+                                    },
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "timestamp": (now + timedelta(seconds=2)).isoformat(),
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "last_token_usage": {"total_tokens": 20},
+                                        "total_token_usage": {"total_tokens": 30},
+                                    },
+                                },
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1), watcher=FakeWatcher()
+                )
+
+            self.assertEqual(
+                tracker.periods["cumulative"][("Codex", "gpt-test")], 30
+            )
+            self.assertEqual(
+                tracker.call_periods["cumulative"][("Codex", "gpt-test")], 2
+            )
+
+    def test_codex_subagent_without_turn_context_inherits_parent_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            session_dir = home / ".codex" / "sessions" / "2026" / "07" / "27"
+            session_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            child = session_dir / "a-child.jsonl"
+            parent = session_dir / "z-parent.jsonl"
+            child.write_text(
+                "\n".join(
+                    (
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": "child-session",
+                                    "parent_thread_id": "parent-session",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "timestamp": now.isoformat(),
+                                "payload": {
+                                    "type": "token_count",
+                                    "info": {
+                                        "last_token_usage": {"total_tokens": 25}
+                                    },
+                                },
+                            }
+                        ),
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parent.write_text(
+                self._codex_lines(
+                    "parent-session",
+                    10,
+                    now + timedelta(seconds=1),
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.CodexTailTracker(
+                    now - timedelta(days=1), watcher=FakeWatcher()
+                )
+
+            self.assertEqual(
+                tracker.periods["cumulative"][("Codex", "gpt-test")], 35
+            )
+            self.assertNotIn(
+                ("Codex", "<unknown>"), tracker.periods["cumulative"]
+            )
+            self.assertEqual(tracker.states[child].model, "gpt-test")
+            self.assertFalse(tracker.pending_usage)
+
     def test_codex_fork_rewritten_history_is_seeded_without_counting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)
@@ -903,7 +1406,7 @@ class TokenWatcherTests(unittest.TestCase):
         self.assertIsInstance(digest, bytes)
         self.assertEqual(len(digest), 16)
 
-    def test_legacy_codex_fingerprints_and_offsets_survive_format_upgrade(self) -> None:
+    def test_old_codex_cache_is_rebuilt_for_cost_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)
             session_dir = home / ".codex" / "sessions" / "2026" / "07" / "18"
@@ -924,16 +1427,7 @@ class TokenWatcherTests(unittest.TestCase):
             payload["fingerprints_b64"] = "AAECAwQFBgcICQoLDA0ODw=="
             cache_path.write_text(json.dumps(payload), encoding="utf-8")
 
-            original_open = token_watcher.Path.open
-
-            def guarded_open(target: Path, *args, **kwargs):
-                if target.suffix.lower() == ".jsonl":
-                    raise AssertionError(f"unexpected legacy JSONL read: {target}")
-                return original_open(target, *args, **kwargs)
-
-            with patch.object(token_watcher.Path, "home", return_value=home), patch.object(
-                token_watcher.Path, "open", guarded_open
-            ):
+            with patch.object(token_watcher.Path, "home", return_value=home):
                 second = token_watcher.CodexTailTracker(
                     now - timedelta(days=1),
                     watcher=FakeWatcher(),
@@ -942,6 +1436,9 @@ class TokenWatcherTests(unittest.TestCase):
             self.assertEqual(second.fingerprint_count(), 1)
             self.assertEqual(second.states[path].offset, path.stat().st_size)
             second.close()
+            rebuilt = json.loads(cache_path.read_text(encoding="utf-8"))
+            self.assertEqual(rebuilt["version"], token_watcher.CODEX_CACHE_VERSION)
+            self.assertIn("cost_periods", rebuilt)
 
     def test_compact_codex_fingerprint_store_keeps_exact_membership(self) -> None:
         tracker = object.__new__(token_watcher.CodexTailTracker)
@@ -1006,6 +1503,91 @@ class TokenWatcherTests(unittest.TestCase):
             side_effect=AssertionError("unexpected Cline taskHistory stat"),
         ):
             self.assertIn("task", cline_cache.read())
+
+    def test_claude_stats_and_active_periods_include_cached_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / ".claude"
+            project_dir = root / "projects" / "project"
+            project_dir.mkdir(parents=True)
+            today = datetime.now(token_watcher.SHANGHAI).date()
+            event_time = datetime.combine(
+                today,
+                datetime.min.time(),
+                tzinfo=token_watcher.SHANGHAI,
+            ) + timedelta(hours=12)
+            stats_path = root / "stats-cache.json"
+            stats_path.write_text(
+                json.dumps(
+                    {
+                        "lastComputedDate": (today + timedelta(days=3)).isoformat(),
+                        "modelUsage": {
+                            "claude-test": {
+                                "inputTokens": 100,
+                                "outputTokens": 10,
+                                "cacheReadInputTokens": 20,
+                                "cacheCreationInputTokens": 5,
+                            }
+                        },
+                        "dailyModelTokens": [
+                            {
+                                "date": today.isoformat(),
+                                "tokensByModel": {"claude-test": 110},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (project_dir / "session.jsonl").write_text(
+                self._claude_line(
+                    "cached",
+                    100,
+                    event_time,
+                    cached=20,
+                    cache_created=5,
+                    output=10,
+                ),
+                encoding="utf-8",
+            )
+
+            periods, status, boundary = token_watcher._parse_claude_usage(stats_path)
+            key = ("Claude Code", "claude-test")
+            self.assertEqual(periods["cumulative"][key], 135)
+            self.assertEqual(periods["today"][key], 135)
+            self.assertEqual(
+                boundary.date(),
+                today + timedelta(days=1),
+            )
+            self.assertIn("含缓存", status)
+
+    def test_claude_tail_tokens_include_cache_reads_and_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            project_dir = home / ".claude" / "projects" / "project"
+            project_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            (project_dir / "session.jsonl").write_text(
+                self._claude_line(
+                    "cached",
+                    5,
+                    now,
+                    cached=7,
+                    cache_created=11,
+                    output=3,
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.ClaudeTailTracker(
+                    now - timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=home / "claude.json",
+                )
+            self.assertEqual(
+                tracker.periods["cumulative"][("Claude Code", "claude-test")],
+                26,
+            )
+            tracker.close()
 
     def test_claude_runtime_changes_do_not_rescan_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1152,6 +1734,31 @@ class TokenWatcherTests(unittest.TestCase):
             key = ("Claude Code", "claude-test")
             self.assertEqual(tracker.periods["cumulative"][key], 7)
             self.assertEqual(tracker.call_periods["cumulative"][key], 2)
+            tracker.close()
+
+    def test_claude_vendor_cost_uses_stats_cache_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            project_dir = home / ".claude" / "projects" / "project"
+            project_dir.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            log_path = project_dir / "session.jsonl"
+            line = self._claude_line("priced", 1_000, now).replace(
+                "claude-test", "claude-opus-4.8"
+            )
+            log_path.write_text(line, encoding="utf-8")
+            with patch.object(token_watcher.Path, "home", return_value=home):
+                tracker = token_watcher.ClaudeTailTracker(
+                    since=now - timedelta(days=1),
+                    cost_since=now + timedelta(days=1),
+                    watcher=FakeWatcher(),
+                    cache_path=home / "claude.json",
+                )
+            key = ("Claude Code", "claude-opus-4.8")
+            self.assertAlmostEqual(
+                tracker.cost_periods["cumulative"][key],
+                0.005,
+            )
             tracker.close()
 
     def test_cline_only_stats_changed_task_files_after_startup(self) -> None:
