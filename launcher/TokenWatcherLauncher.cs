@@ -1,11 +1,17 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
 
 internal static class TokenWatcherLauncher
 {
+    private const uint AttachParentProcess = 0xFFFFFFFF;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(uint processId);
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -25,10 +31,15 @@ internal static class TokenWatcherLauncher
 
         try
         {
+            bool wait = ShouldWait(args);
+            if (wait)
+            {
+                AttachConsole(AttachParentProcess);
+            }
             ProcessStartInfo startInfo = new ProcessStartInfo
             {
                 FileName = executable,
-                WorkingDirectory = runtimeDirectory,
+                WorkingDirectory = root,
                 UseShellExecute = false,
                 Arguments = BuildArguments(args)
             };
@@ -38,7 +49,7 @@ internal static class TokenWatcherLauncher
                 return 3;
             }
 
-            if (ShouldWait(args))
+            if (wait)
             {
                 process.WaitForExit();
                 return process.ExitCode;

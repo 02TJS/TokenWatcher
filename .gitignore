@@ -9,6 +9,8 @@ dist/
 TokenWatcher.runtime/
 outputs/
 *.exe
+*.zip
+*.sha256
 *.log
 *.jsonl
 *.png

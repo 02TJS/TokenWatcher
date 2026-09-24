@@ -5,10 +5,10 @@ import base64
 import csv
 import hashlib
 import json
+import math
 import os
 import queue
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -19,6 +19,20 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
+MODULE_DIR = Path(__file__).resolve().parent
+if str(MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(MODULE_DIR))
+
+from dsh_usage_tracker import DshTailTracker
+from model_pricing import (
+    DEFAULT_PRICES,
+    MODEL_VERIFIED_ON,
+    PRICE_VERIFIED_ON,
+    resolve_price,
+    usage_cost_usd as calculate_usage_cost_usd,
+)
+from sub2api_usage_poller import Sub2ApiUsagePoller
+
 
 APP_TITLE = "TokenWatcher"
 INSTANCE_MUTEX_NAME = "Local\\TokenWatcher.Singleton"
@@ -26,6 +40,9 @@ START_DATE = date(2026, 2, 1)
 DEFAULT_REFRESH_SECONDS = 0.25
 MIN_REFRESH_SECONDS = 0.1
 MAX_REFRESH_SECONDS = 2.0
+MAX_USAGE_VALUE = (1 << 63) - 1
+LIVE_DELTA_VISIBLE_MS = 1600
+STARTUP_DELTA_VISIBLE_MS = 8000
 REFRESH_OPTIONS = (0.1, 0.25, 0.5, 1.0, 2.0)
 REFRESH_SECONDS = DEFAULT_REFRESH_SECONDS
 STARTUP_HOT_SECONDS = 300.0
@@ -47,6 +64,7 @@ PLATFORM_COLORS = {
     "Claude Code": "#F59E42",
     "Cline": "#26C6A2",
     "DeepSeek API": "#536DFE",
+    "DeepSeek Harness": "#7C4DFF",
 }
 REPORT_FOLDER_NAME = "codex_claude_usage_since_2026-02"
 CLINE_HISTORY = (
@@ -73,7 +91,10 @@ SUB2API_PSQL = Path(
         str(SUB2API_ROOT / "runtime" / "pgsql" / "bin" / "psql.exe"),
     )
 )
-SUB2API_POLL_SECONDS = 5.0
+DSH_HOME = Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh")))
+DSH_SESSIONS = Path(
+    os.environ.get("TOKENWATCHER_DSH_SESSIONS", str(DSH_HOME / "sessions"))
+)
 CODEX_USAGE_KEYS = (
     "input_tokens",
     "cached_input_tokens",
@@ -81,14 +102,14 @@ CODEX_USAGE_KEYS = (
     "reasoning_output_tokens",
     "total_tokens",
 )
-CODEX_CACHE_VERSION = 7
-CLAUDE_CACHE_VERSION = 4
-USAGE_SNAPSHOT_CACHE_VERSION = 7
+CODEX_CACHE_VERSION = 8
+CLAUDE_CACHE_VERSION = 6
+USAGE_SNAPSHOT_CACHE_VERSION = 8
 WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 CASCADIA_MONO_FONT = str(WINDOWS_FONTS / "CascadiaMono.ttf")
 YAHEI_FONT = str(WINDOWS_FONTS / "msyh.ttc")
 YAHEI_BOLD_FONT = str(WINDOWS_FONTS / "msyhbd.ttc")
-WINDOW_WIDTH = 852
+WINDOW_WIDTH = 902
 WINDOW_HEIGHT = 260
 ROW_HEIGHT = 56
 ROW_MIDDLE = ROW_HEIGHT // 2
@@ -118,7 +139,7 @@ MODEL_CALL_LEFT_SHIFT = 16
 RANK_LEFT_SHIFT = 16
 RANK_COLUMN_WIDTH = 28
 MODEL_COLUMN_WIDTH = 116
-CALL_COLUMN_WIDTH = 100
+CALL_COLUMN_WIDTH = 150
 DELTA_COLUMN_WIDTH = 132
 TOKEN_COLUMN_WIDTH = 218
 COST_COLUMN_WIDTH = 150
@@ -300,83 +321,6 @@ def save_refresh_seconds(
 
 def format_refresh_seconds(value: float) -> str:
     return f"{clamp_refresh_seconds(value):g}"
-
-DEFAULT_PRICES = {
-    "gpt-5.2-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
-    "gpt-5.3-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
-    "gpt-5.4": {
-        "input": 2.5,
-        "cached": 0.25,
-        "output": 15.0,
-        "long_input": 5.0,
-        "long_cached": 0.5,
-        "long_output": 22.5,
-    },
-    "gpt-5.4-mini": {"input": 0.75, "cached": 0.075, "output": 4.5},
-    "gpt-5.5": {
-        "input": 5.0,
-        "cached": 0.5,
-        "output": 30.0,
-        "long_input": 10.0,
-        "long_cached": 1.0,
-        "long_output": 45.0,
-    },
-    "gpt-5.6-sol": {
-        "input": 5.0,
-        "cached": 0.5,
-        "cache_write": 6.25,
-        "output": 30.0,
-        "long_input": 10.0,
-        "long_cached": 1.0,
-        "long_cache_write": 12.5,
-        "long_output": 45.0,
-    },
-    "gpt-5.6-terra": {
-        "input": 2.5,
-        "cached": 0.25,
-        "cache_write": 3.125,
-        "output": 15.0,
-        "long_input": 5.0,
-        "long_cached": 0.5,
-        "long_cache_write": 6.25,
-        "long_output": 22.5,
-    },
-    "gpt-5.6-luna": {
-        "input": 1.0,
-        "cached": 0.1,
-        "cache_write": 1.25,
-        "output": 6.0,
-        "long_input": 2.0,
-        "long_cached": 0.2,
-        "long_cache_write": 2.5,
-        "long_output": 9.0,
-    },
-    "claude-opus-4.8": {
-        "input": 5.0,
-        "cached": 0.5,
-        "cache_write": 6.25,
-        "output": 25.0,
-    },
-    "claude-opus-4-8": {
-        "input": 5.0,
-        "cached": 0.5,
-        "cache_write": 6.25,
-        "output": 25.0,
-    },
-    "claude-sonnet-4.6": {
-        "input": 3.0,
-        "cached": 0.3,
-        "cache_write": 3.75,
-        "output": 15.0,
-    },
-    "deepseek-v4-pro": {
-        "input": 0.435,
-        "cached": 0.003625,
-        "cache_write": 0.435,
-        "output": 0.87,
-    },
-}
-
 
 def _percentile(values: list[float], fraction: float) -> float:
     if not values:
@@ -826,6 +770,38 @@ def parse_time(value: str | None) -> datetime:
     return parsed
 
 
+def nonnegative_int(value: object, field_name: str = "value") -> int:
+    """Parse a finite non-negative integer from a durable or provider boundary."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{field_name} must be a finite integer")
+        parsed = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"\+?\d+", value.strip()):
+        parsed = int(value.strip())
+    else:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    if parsed < 0 or parsed > MAX_USAGE_VALUE:
+        raise ValueError(f"{field_name} is outside the supported range")
+    return parsed
+
+
+def nonnegative_float(value: object, field_name: str = "value") -> float:
+    """Parse a finite non-negative number from a durable or provider boundary."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a non-negative number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{field_name} must be finite and non-negative")
+    return parsed
+
+
 def format_tokens(value: int) -> str:
     return f"{int(value):,}"
 
@@ -834,6 +810,78 @@ def format_cost(value: float | None) -> str:
     if value is None:
         return "—"
     return f"${float(value):,.2f}"
+
+
+def observed_growth(
+    current: int,
+    previous: dict[tuple[str, str], int],
+    key: tuple[str, str],
+    *,
+    include_new_key: bool,
+) -> int:
+    """Return growth against a prior snapshot, optionally counting a new key."""
+    return int(current) - int(previous.get(key, 0 if include_new_key else current))
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def emit_stdout(text: str) -> bool:
+    payload = text + "\n"
+    if sys.stdout is not None:
+        try:
+            sys.stdout.write(payload)
+            sys.stdout.flush()
+            return True
+        except (OSError, ValueError):
+            pass
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.AttachConsole(wintypes.DWORD(-1).value)
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle in (None, 0, invalid_handle):
+            return False
+        mode = wintypes.DWORD()
+        written = wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return bool(
+                kernel32.WriteConsoleW(
+                    handle,
+                    payload,
+                    len(payload),
+                    ctypes.byref(written),
+                    None,
+                )
+            )
+        encoded = payload.encode("utf-8")
+        return bool(
+            kernel32.WriteFile(
+                handle,
+                encoded,
+                len(encoded),
+                ctypes.byref(written),
+                None,
+            )
+        )
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def compact_model_name(model: str) -> str:
@@ -964,24 +1012,36 @@ def load_pricing(report_dir: Path) -> dict[str, dict[str, float]]:
         "input": "input_usd_per_mtok",
         "cached": "cached_input_usd_per_mtok",
         "cache_write": "cache_write_usd_per_mtok",
+        "cache_write_1h": "cache_write_1h_usd_per_mtok",
         "output": "output_usd_per_mtok",
         "long_input": "long_input_usd_per_mtok",
         "long_cached": "long_cached_input_usd_per_mtok",
+        "long_cache_write": "long_cache_write_usd_per_mtok",
         "long_output": "long_output_usd_per_mtok",
+        "peak_input": "peak_input_usd_per_mtok",
+        "peak_cached": "peak_cached_input_usd_per_mtok",
+        "peak_cache_write": "peak_cache_write_usd_per_mtok",
+        "peak_output": "peak_output_usd_per_mtok",
     }
     for row in rows:
         if row.get("pricing_status") != "official_standard_price":
             continue
-        values = {}
+        expected_date = MODEL_VERIFIED_ON.get(str(row.get("model") or ""), PRICE_VERIFIED_ON)
+        if str(row.get("verified_on") or "") != expected_date:
+            continue
+        model = str(row.get("model") or "").strip()
+        if not model:
+            continue
+        values = dict(prices.get(model, {}))
         try:
             for name, field_name in field_map.items():
                 raw_value = str(row.get(field_name) or "").strip()
                 if raw_value:
-                    values[name] = float(raw_value)
+                    values[name] = nonnegative_float(raw_value, field_name)
         except ValueError:
             continue
         if "input" in values and "output" in values:
-            prices[str(row.get("model") or "<unknown>")] = values
+            prices[model] = values
     return prices
 
 
@@ -992,41 +1052,75 @@ def usage_cost_usd(
     source: str,
     prices: dict[str, dict[str, float]] | None = None,
     context_window: int = 0,
+    event_time: datetime | None = None,
+    pricing_bucket: str | None = None,
+    include_promotions: bool = False,
 ) -> float | None:
-    price = (prices or DEFAULT_PRICES).get(model)
-    if price is None:
-        return None
-    input_tokens = int(usage.get("input_tokens") or 0)
-    output_tokens = int(usage.get("output_tokens") or 0)
-    if source == "codex":
-        cached_tokens = int(usage.get("cached_input_tokens") or 0)
-        uncached_tokens = max(0, input_tokens - cached_tokens)
-        cache_write_tokens = 0
-        long_context = (
-            "long_input" in price
-            and context_window > LONG_CONTEXT_THRESHOLD
-            and input_tokens > LONG_CONTEXT_THRESHOLD
+    try:
+        input_tokens = nonnegative_int(
+            usage.get("input_tokens") or 0,
+            "input_tokens",
         )
+        output_tokens = nonnegative_int(
+            usage.get("output_tokens") or 0,
+            "output_tokens",
+        )
+    except ValueError:
+        return None
+    if source == "codex":
+        try:
+            cached_tokens = nonnegative_int(
+                usage.get("cached_input_tokens") or 0,
+                "cached_input_tokens",
+            )
+        except ValueError:
+            return None
+        if cached_tokens > input_tokens:
+            return None
+        uncached_tokens = input_tokens - cached_tokens
+        cache_write_tokens = 0
     else:
         uncached_tokens = input_tokens
-        cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
-        cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+        try:
+            cached_tokens = nonnegative_int(
+                usage.get("cache_read_input_tokens") or 0,
+                "cache_read_input_tokens",
+            )
+            cache_write_tokens = nonnegative_int(
+                usage.get("cache_creation_input_tokens") or 0,
+                "cache_creation_input_tokens",
+            )
+        except ValueError:
+            return None
+    price = resolve_price(
+        model,
+        prices=prices or DEFAULT_PRICES,
+        event_time=event_time,
+        bucket=pricing_bucket,
+        include_promotions=include_promotions,
+    )
+    if price is None:
+        return None
+    threshold = price.get("long_threshold")
+    long_context = None
+    if threshold is None and "long_input" in price:
         long_context = (
-            "long_input" in price
+            context_window > LONG_CONTEXT_THRESHOLD
             and uncached_tokens + cached_tokens + cache_write_tokens
             > LONG_CONTEXT_THRESHOLD
         )
-    prefix = "long_" if long_context else ""
-    input_price = price[f"{prefix}input"]
-    cached_price = price.get(f"{prefix}cached", input_price)
-    output_price = price[f"{prefix}output"]
-    cache_write_price = price.get(f"{prefix}cache_write", cached_price)
-    return (
-        uncached_tokens * input_price
-        + cached_tokens * cached_price
-        + cache_write_tokens * cache_write_price
-        + output_tokens * output_price
-    ) / 1_000_000
+    return calculate_usage_cost_usd(
+        model,
+        input_tokens=uncached_tokens,
+        cache_read_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
+        output_tokens=output_tokens,
+        prices=prices or DEFAULT_PRICES,
+        event_time=event_time,
+        bucket=pricing_bucket,
+        long_context=long_context,
+        include_promotions=include_promotions,
+    )
 
 
 @dataclass
@@ -1037,59 +1131,101 @@ class Baseline:
     call_periods: dict[str, Counter] = field(default_factory=empty_periods)
     cost_periods: dict[str, Counter] = field(default_factory=empty_periods)
     report_mtime: float = 0.0
+    warnings: tuple[str, ...] = ()
 
 
 def load_baseline(report_dir: Path) -> Baseline:
     summary_path = report_dir / "summary.json"
-    if not summary_path.exists():
-        return Baseline(
-            report_dir=report_dir,
-            refreshed_at=datetime.combine(
-                START_DATE,
-                datetime.min.time(),
-                tzinfo=SHANGHAI,
-            ),
-        )
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    warnings: list[str] = []
+    refreshed_at = datetime.combine(
+        START_DATE,
+        datetime.min.time(),
+        tzinfo=SHANGHAI,
+    )
+    report_mtime = 0.0
+    try:
+        report_mtime = summary_path.stat().st_mtime
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not isinstance(summary, dict):
+            raise ValueError("summary root is not an object")
+        refreshed_at = parse_time(summary.get("refreshed_at_shanghai"))
+    except FileNotFoundError:
+        pass
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        warnings.append(f"summary.json: {type(exc).__name__}")
+
     baseline = Baseline(
         report_dir=report_dir,
-        refreshed_at=parse_time(summary.get("refreshed_at_shanghai")),
-        report_mtime=summary_path.stat().st_mtime,
+        refreshed_at=refreshed_at,
+        report_mtime=report_mtime,
     )
+
+    def rows(path: Path) -> list[dict[str, str]]:
+        if not path.exists():
+            return []
+        try:
+            return read_csv(path)
+        except (OSError, csv.Error, UnicodeError) as exc:
+            warnings.append(f"{path.name}: {type(exc).__name__}")
+            return []
+
     model_total_path = report_dir / "model_total.csv"
-    if model_total_path.exists():
-        for row in read_csv(model_total_path):
-            baseline.periods["cumulative"][(row["platform"], row["model"])] += int(
-                row["total_tokens"]
+    for row in rows(model_total_path):
+        try:
+            key = (str(row["platform"]), str(row["model"]))
+            baseline.periods["cumulative"][key] += nonnegative_int(
+                row["total_tokens"],
+                "total_tokens",
             )
+        except (KeyError, TypeError, ValueError):
+            warnings.append(f"{model_total_path.name}: skipped invalid row")
+
     now_date = datetime.now(SHANGHAI).date()
     daily_path = report_dir / "daily_by_platform_model.csv"
-    if daily_path.exists():
-        for row in read_csv(daily_path):
-            row_date = date.fromisoformat(row["date"])
-            key = (row["platform"], row["model"])
-            tokens = int(row["total_tokens"])
-            calls = int(row.get("responses") or 0)
-            for period in active_periods(row_date, now_date):
-                baseline.call_periods[period][key] += calls
-                if period != "cumulative":
-                    baseline.periods[period][key] += tokens
+    for row in rows(daily_path):
+        try:
+            row_date = date.fromisoformat(str(row["date"]))
+            key = (str(row["platform"]), str(row["model"]))
+            tokens = nonnegative_int(row["total_tokens"], "total_tokens")
+            calls = nonnegative_int(row.get("responses") or 0, "responses")
+        except (KeyError, TypeError, ValueError):
+            warnings.append(f"{daily_path.name}: skipped invalid row")
+            continue
+        for period in active_periods(row_date, now_date):
+            baseline.call_periods[period][key] += calls
+            if period != "cumulative":
+                baseline.periods[period][key] += tokens
+
     model_cost_path = report_dir / "model_cost.csv"
-    if model_cost_path.exists():
-        for row in read_csv(model_cost_path):
-            key = (row["platform"], row["model"])
-            baseline.cost_periods["cumulative"][key] += float(
-                row["estimated_cost_usd"]
+    for row in rows(model_cost_path):
+        try:
+            key = (str(row["platform"]), str(row["model"]))
+            cost_usd = nonnegative_float(
+                row["estimated_cost_usd"],
+                "estimated_cost_usd",
             )
+        except (KeyError, TypeError, ValueError):
+            warnings.append(f"{model_cost_path.name}: skipped invalid row")
+            continue
+        baseline.cost_periods["cumulative"][key] += cost_usd
+
     daily_cost_path = report_dir / "daily_cost_by_platform_model.csv"
-    if daily_cost_path.exists():
-        for row in read_csv(daily_cost_path):
-            row_date = date.fromisoformat(row["date"])
-            key = (row["platform"], row["model"])
-            cost_usd = float(row["estimated_cost_usd"])
-            for period in active_periods(row_date, now_date):
-                if period != "cumulative":
-                    baseline.cost_periods[period][key] += cost_usd
+    for row in rows(daily_cost_path):
+        try:
+            row_date = date.fromisoformat(str(row["date"]))
+            key = (str(row["platform"]), str(row["model"]))
+            cost_usd = nonnegative_float(
+                row["estimated_cost_usd"],
+                "estimated_cost_usd",
+            )
+        except (KeyError, TypeError, ValueError):
+            warnings.append(f"{daily_cost_path.name}: skipped invalid row")
+            continue
+        for period in active_periods(row_date, now_date):
+            if period != "cumulative":
+                baseline.cost_periods[period][key] += cost_usd
+
+    baseline.warnings = tuple(dict.fromkeys(warnings))
     return baseline
 
 
@@ -1101,7 +1237,10 @@ class CodexFileState:
     session_id: str = ""
     parent_session_id: str = ""
     last_mtime: float = 0.0
+    last_mtime_ns: int = 0
     last_size: int = 0
+    file_dev: int = 0
+    file_ino: int = 0
     next_check: float = 0.0
     watching: bool = True
     stop_after_initial: bool = False
@@ -1140,8 +1279,11 @@ class CodexTailTracker:
         self.seen_packed = b""
         self.seen: set[bytes] = set()
         self.cached_files: dict[str, dict] = {}
+        self.legacy_cached_files: dict[str, dict] = {}
+        self.path_name_counts: Counter = Counter()
         self.session_models: dict[str, str] = {}
         self.session_parents: dict[str, str] = {}
+        self.model_resolver: Callable[[str], str] = lambda model: model
         self.pending_usage: dict[str, list[CodexPendingUsage]] = {}
         self.pending_fingerprints: set[bytes] = set()
         self.cache_dirty = False
@@ -1149,8 +1291,11 @@ class CodexTailTracker:
         self.errors = 0
         self.cache_errors = 0
         self.next_fallback_check = 0.0
+        self.rebuild_required = False
         self._load_cache()
         self._discover_startup()
+        if self.rebuild_required:
+            self._rebuild_all()
 
     @staticmethod
     def _known_model(model: str | None) -> bool:
@@ -1217,16 +1362,19 @@ class CodexTailTracker:
                 self.cache_dirty = True
 
     def _add_resolved_usage(self, model: str, pending: CodexPendingUsage) -> None:
-        key = ("Codex", model)
+        resolved_model = str(self.model_resolver(model) or model).strip() or model
+        key = ("Codex", resolved_model)
         event_date = pending.event_time.astimezone(SHANGHAI).date()
         add_period_usage(self.periods, key, pending.total_tokens, event_date)
         add_period_usage(self.call_periods, key, 1, event_date)
         cost_usd = usage_cost_usd(
-            model,
+            resolved_model,
             pending.usage,
             source="codex",
             prices=self.prices,
             context_window=pending.context_window,
+            event_time=pending.event_time,
+            include_promotions=True,
         )
         if cost_usd is not None:
             add_period_cost(self.cost_periods, key, cost_usd, event_date)
@@ -1235,6 +1383,68 @@ class CodexTailTracker:
             if self.last_event
             else pending.event_time
         )
+
+    @staticmethod
+    def _remap_periods(
+        periods: dict[str, Counter],
+        resolver: Callable[[str], str],
+    ) -> dict[str, Counter]:
+        remapped = empty_periods()
+        for period in PERIODS:
+            for (platform, model), value in periods[period].items():
+                resolved_model = str(resolver(model) or model).strip() or model
+                remapped[period][(platform, resolved_model)] += value
+        return remapped
+
+    def set_model_resolver(self, resolver: Callable[[str], str] | None) -> None:
+        """Apply a model mapping without changing any usage quantities."""
+        self.model_resolver = resolver or (lambda model: model)
+        changed = False
+        for state in self.states.values():
+            if not self._known_model(state.model):
+                continue
+            resolved_model = str(self.model_resolver(state.model) or state.model).strip()
+            if resolved_model and resolved_model != state.model:
+                state.model = resolved_model
+                changed = True
+            if state.session_id and self.session_models.get(state.session_id) != state.model:
+                self.session_models[state.session_id] = state.model
+                changed = True
+        for record in self.cached_files.values():
+            model = str(record.get("model") or "")
+            if not self._known_model(model):
+                continue
+            resolved_model = str(self.model_resolver(model) or model).strip()
+            if resolved_model and resolved_model != model:
+                record["model"] = resolved_model
+                changed = True
+        for session_id, model in list(self.session_models.items()):
+            if not self._known_model(model):
+                continue
+            resolved_model = str(self.model_resolver(model) or model).strip()
+            if resolved_model and resolved_model != model:
+                self.session_models[session_id] = resolved_model
+                changed = True
+        remapped_periods = self._remap_periods(self.periods, self.model_resolver)
+        remapped_calls = self._remap_periods(
+            self.call_periods,
+            self.model_resolver,
+        )
+        remapped_costs = self._remap_periods(
+            self.cost_periods,
+            self.model_resolver,
+        )
+        if (
+            changed
+            or remapped_periods != self.periods
+            or remapped_calls != self.call_periods
+            or remapped_costs != self.cost_periods
+        ):
+            self.periods = remapped_periods
+            self.call_periods = remapped_calls
+            self.cost_periods = remapped_costs
+            self.cache_dirty = True
+        self._flush_pending_usage()
 
     def _flush_pending_usage(self) -> None:
         for session_id in list(self.pending_usage):
@@ -1250,9 +1460,11 @@ class CodexTailTracker:
                 self._add_resolved_usage(model, pending)
                 self.cache_dirty = True
 
-    @staticmethod
-    def _cache_key(path: Path) -> str:
-        return path.name
+    def _cache_key(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.root).as_posix()
+        except ValueError:
+            return str(path.resolve())
 
     def _load_cache(self) -> None:
         try:
@@ -1262,7 +1474,7 @@ class CodexTailTracker:
             ).date()
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
             version = int(payload.get("version") or 0)
-            if version != CODEX_CACHE_VERSION:
+            if version not in (7, CODEX_CACHE_VERSION):
                 return
             files = payload.get("files") or {}
             if not isinstance(files, dict):
@@ -1272,11 +1484,16 @@ class CodexTailTracker:
             if len(packed) % 16:
                 raise ValueError("invalid packed Codex fingerprints")
             self.seen_packed = packed
-            self.cached_files = {
+            decoded_files = {
                 str(key): value
                 for key, value in files.items()
                 if isinstance(value, dict)
             }
+            if version == CODEX_CACHE_VERSION:
+                self.cached_files = decoded_files
+            else:
+                self.legacy_cached_files = decoded_files
+                self.cache_dirty = True
             if str(payload.get("since") or "") == self.since.isoformat():
                 self.periods = ClaudeTailTracker._decode_periods(
                     payload.get("periods")
@@ -1393,7 +1610,16 @@ class CodexTailTracker:
         stat: os.stat_result,
         startup_cold: bool,
     ) -> tuple[CodexFileState, bool]:
-        record = self.cached_files.get(self._cache_key(path)) or {}
+        cache_key = self._cache_key(path)
+        record = self.cached_files.get(cache_key) or {}
+        if (
+            not record
+            and self.path_name_counts[path.name] == 1
+            and path.name in self.legacy_cached_files
+        ):
+            record = self.legacy_cached_files[path.name]
+            self.cached_files[cache_key] = record
+            self.cache_dirty = True
         cached_size = int(record.get("size") or 0)
         cached_mtime_ns = int(record.get("mtime_ns") or 0)
         cached_offset = int(record.get("offset") or 0)
@@ -1401,7 +1627,6 @@ class CodexTailTracker:
             cached_size == stat.st_size
             and cached_mtime_ns == stat.st_mtime_ns
             and cached_offset == stat.st_size
-            and bool(record)
             and self._known_model(str(record.get("model") or ""))
         )
         offset = cached_offset
@@ -1423,7 +1648,10 @@ class CodexTailTracker:
             session_id=str(record.get("session_id") or ""),
             parent_session_id=str(record.get("parent_session_id") or ""),
             last_mtime=stat.st_mtime,
+            last_mtime_ns=int(record.get("mtime_ns") or stat.st_mtime_ns),
             last_size=stat.st_size if exact else offset,
+            file_dev=int(record.get("dev") or getattr(stat, "st_dev", 0)),
+            file_ino=int(record.get("ino") or getattr(stat, "st_ino", 0)),
             watching=not startup_cold,
             stop_after_initial=startup_cold,
         )
@@ -1438,6 +1666,8 @@ class CodexTailTracker:
         record = {
             "size": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
+            "dev": int(getattr(stat, "st_dev", 0)),
+            "ino": int(getattr(stat, "st_ino", 0)),
             "offset": state.offset,
             "session_id": state.session_id,
             "parent_session_id": state.parent_session_id,
@@ -1489,7 +1719,9 @@ class CodexTailTracker:
 
     def _discover_startup(self) -> None:
         entries = []
-        for path in self._paths():
+        paths = self._paths()
+        self.path_name_counts = Counter(path.name for path in paths)
+        for path in paths:
             try:
                 stat = path.stat()
             except OSError:
@@ -1566,8 +1798,11 @@ class CodexTailTracker:
                 state.watching = True
                 state.stop_after_initial = False
                 state.next_check = 0.0
-        for path in set(self.states) - current_paths:
+        removed = set(self.states) - current_paths
+        for path in removed:
             del self.states[path]
+        if removed:
+            self.rebuild_required = True
         return changed
 
     def _consume(self, data: bytes, state: CodexFileState, initial: bool) -> None:
@@ -1603,11 +1838,22 @@ class CodexTailTracker:
             usage = info.get("last_token_usage")
             if not isinstance(usage, dict):
                 continue
-            total_tokens = int(usage.get("total_tokens") or 0)
-            if not total_tokens:
-                total_tokens = int(usage.get("input_tokens") or 0) + int(
-                    usage.get("output_tokens") or 0
+            try:
+                total_tokens = nonnegative_int(
+                    usage.get("total_tokens") or 0,
+                    "total_tokens",
                 )
+                if not total_tokens:
+                    total_tokens = nonnegative_int(
+                        usage.get("input_tokens") or 0,
+                        "input_tokens",
+                    ) + nonnegative_int(
+                        usage.get("output_tokens") or 0,
+                        "output_tokens",
+                    )
+            except ValueError:
+                self.errors += 1
+                continue
             if total_tokens <= 0:
                 continue
             fingerprint = codex_fingerprint_digest(
@@ -1628,12 +1874,20 @@ class CodexTailTracker:
                 self.seen.add(fingerprint)
                 self.cache_dirty = True
                 continue
+            try:
+                context_window = nonnegative_int(
+                    info.get("model_context_window") or 0,
+                    "model_context_window",
+                )
+            except ValueError:
+                self.errors += 1
+                context_window = 0
             pending = CodexPendingUsage(
                 fingerprint=fingerprint,
                 session_id=state.session_id,
                 total_tokens=total_tokens,
                 usage=usage,
-                context_window=int(info.get("model_context_window") or 0),
+                context_window=context_window,
                 event_time=event_time,
             )
             model = (
@@ -1669,14 +1923,30 @@ class CodexTailTracker:
             stat = path.stat()
             size = stat.st_size
             mtime = stat.st_mtime
-            if size < state.offset:
-                state.offset = 0
-                state.remainder = b""
-                state.model = "<unknown>"
-                state.session_id = ""
-                state.parent_session_id = ""
+            device = int(getattr(stat, "st_dev", 0))
+            inode = int(getattr(stat, "st_ino", 0))
+            file_replaced = bool(
+                state.offset
+                and (
+                    (state.file_dev and device != state.file_dev)
+                    or (state.file_ino and inode and inode != state.file_ino)
+                )
+            )
+            if size < state.offset or file_replaced:
+                self.rebuild_required = True
+                return
+            if (
+                size == state.offset
+                and state.last_mtime_ns
+                and stat.st_mtime_ns != state.last_mtime_ns
+            ):
+                self.rebuild_required = True
+                return
             state.last_size = size
             state.last_mtime = mtime
+            state.last_mtime_ns = stat.st_mtime_ns
+            state.file_dev = device
+            state.file_ino = inode
             if size == state.offset:
                 if initial and state.stop_after_initial:
                     state.watching = False
@@ -1695,10 +1965,29 @@ class CodexTailTracker:
         except FileNotFoundError:
             if state.offset:
                 state.watching = False
+                self.rebuild_required = True
             else:
                 state.next_check = now + REFRESH_SECONDS
         except OSError:
             self.errors += 1
+
+    def _rebuild_all(self) -> None:
+        """Rebuild this source once after a notified historical rewrite."""
+        self.states.clear()
+        self.periods = empty_periods()
+        self.call_periods = empty_periods()
+        self.cost_periods = empty_periods()
+        self.seen_packed = b""
+        self.seen.clear()
+        self.cached_files.clear()
+        self.session_models.clear()
+        self.session_parents.clear()
+        self.pending_usage.clear()
+        self.pending_fingerprints.clear()
+        self.last_event = None
+        self.cache_dirty = True
+        self.rebuild_required = False
+        self._discover_startup()
 
     def poll(self) -> None:
         changed = self._discover_changes()
@@ -1718,6 +2007,10 @@ class CodexTailTracker:
             if state is None:
                 continue
             self._read_path(path, state, now=now)
+            if self.rebuild_required:
+                break
+        if self.rebuild_required:
+            self._rebuild_all()
 
     def close(self) -> None:
         self._save_cache()
@@ -1796,13 +2089,21 @@ def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, date
         )
         return periods, "Claude stats-cache 不存在", boundary
     stats = json.loads(stats_path.read_text(encoding="utf-8"))
-    for model, usage in stats.get("modelUsage", {}).items():
-        periods["cumulative"][("Claude Code", model)] = (
-            int(usage.get("inputTokens") or 0)
-            + int(usage.get("outputTokens") or 0)
-            + int(usage.get("cacheReadInputTokens") or 0)
-            + int(usage.get("cacheCreationInputTokens") or 0)
-        )
+    for model, usage in (stats.get("modelUsage") or {}).items():
+        if not isinstance(usage, dict):
+            continue
+        try:
+            periods["cumulative"][("Claude Code", str(model))] = sum(
+                nonnegative_int(usage.get(field) or 0, field)
+                for field in (
+                    "inputTokens",
+                    "outputTokens",
+                    "cacheReadInputTokens",
+                    "cacheCreationInputTokens",
+                )
+            )
+        except ValueError:
+            continue
     last_daily_date: date | None = None
     for row in stats.get("dailyModelTokens", []):
         try:
@@ -1811,10 +2112,14 @@ def _parse_claude_usage(stats_path: Path) -> tuple[dict[str, Counter], str, date
             continue
         last_daily_date = max(last_daily_date, row_date) if last_daily_date else row_date
         for model, tokens in (row.get("tokensByModel") or {}).items():
-            key = ("Claude Code", model)
+            try:
+                parsed_tokens = nonnegative_int(tokens or 0, "tokensByModel")
+            except ValueError:
+                continue
+            key = ("Claude Code", str(model))
             for period in active_periods(row_date):
                 if period != "cumulative":
-                    periods[period][key] += int(tokens or 0)
+                    periods[period][key] += parsed_tokens
     last_date_text = stats.get("lastComputedDate")
     if last_daily_date is not None:
         boundary = datetime.combine(
@@ -1870,7 +2175,24 @@ class ClaudeUsageCache:
             or signature != self.last_signature
             or current_date != self.period_date
         ):
-            self.cached = _parse_claude_usage(self.stats_path)
+            try:
+                parsed = _parse_claude_usage(self.stats_path)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                if self.cached is None:
+                    boundary = datetime.now(SHANGHAI).replace(
+                        hour=0,
+                        minute=0,
+                        second=0,
+                        microsecond=0,
+                    )
+                    self.cached = (
+                        empty_periods(),
+                        f"Claude stats-cache 无效：{type(exc).__name__}",
+                        boundary,
+                    )
+                    self.period_date = current_date
+                return self.cached
+            self.cached = parsed
             self.last_signature = signature
             self.period_date = current_date
         return self.cached
@@ -1881,7 +2203,10 @@ class ClaudeFileState:
     offset: int = 0
     remainder: bytes = b""
     last_mtime: float = 0.0
+    last_mtime_ns: int = 0
     last_size: int = 0
+    file_dev: int = 0
+    file_ino: int = 0
     next_check: float = 0.0
     watching: bool = True
     stop_after_initial: bool = False
@@ -1914,15 +2239,18 @@ class ClaudeTailTracker:
         self.periods = empty_periods()
         self.call_periods = empty_periods()
         self.cost_periods = empty_periods()
-        self.seen: set[tuple] = set()
+        self.seen: set[bytes] = set()
         self.cached_files: dict[str, dict] = {}
         self.cache_dirty = False
         self.last_event: datetime | None = None
         self.errors = 0
         self.cache_errors = 0
         self.next_fallback_check = 0.0
+        self.rebuild_required = False
         self._load_cache()
         self._discover_startup()
+        if self.rebuild_required:
+            self._rebuild_all()
         self._save_cache()
 
     @staticmethod
@@ -1958,7 +2286,8 @@ class ClaudeTailTracker:
                 SHANGHAI,
             ).date()
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            if int(payload.get("version") or 0) != CLAUDE_CACHE_VERSION:
+            version = int(payload.get("version") or 0)
+            if version not in (4, 5, CLAUDE_CACHE_VERSION):
                 return
             if str(payload.get("token_since") or "") != self.since.isoformat():
                 return
@@ -1992,11 +2321,26 @@ class ClaudeTailTracker:
             )
             if reset:
                 self.cache_dirty = True
-            self.seen = {
-                tuple(str(value) for value in row)
-                for row in payload.get("seen") or []
-                if isinstance(row, list) and len(row) == 3
-            }
+            if version == CLAUDE_CACHE_VERSION:
+                encoded_seen = str(payload.get("seen_b64") or "")
+                packed_seen = (
+                    base64.b64decode(encoded_seen.encode("ascii"))
+                    if encoded_seen
+                    else b""
+                )
+                if len(packed_seen) % 16:
+                    raise ValueError("invalid packed Claude fingerprints")
+                self.seen = {
+                    packed_seen[index : index + 16]
+                    for index in range(0, len(packed_seen), 16)
+                }
+            else:
+                self.seen = {
+                    codex_fingerprint_digest(tuple(str(value) for value in row))
+                    for row in payload.get("seen") or []
+                    if isinstance(row, list) and len(row) == 3
+                }
+                self.cache_dirty = True
             self.cached_files = {
                 str(path): value
                 for path, value in (payload.get("files") or {}).items()
@@ -2020,7 +2364,7 @@ class ClaudeTailTracker:
             "periods": self._encode_periods(self.periods),
             "call_periods": self._encode_periods(self.call_periods),
             "cost_periods": self._encode_periods(self.cost_periods, float),
-            "seen": [list(row) for row in sorted(self.seen)],
+            "seen_b64": base64.b64encode(b"".join(sorted(self.seen))).decode("ascii"),
             "last_event": self.last_event.isoformat() if self.last_event else None,
             "files": self.cached_files,
         }
@@ -2051,7 +2395,10 @@ class ClaudeTailTracker:
             offset=int(cached.get("offset") or 0),
             remainder=remainder,
             last_mtime=float(cached.get("mtime") or 0.0),
+            last_mtime_ns=int(cached.get("mtime_ns") or 0),
             last_size=int(cached.get("size") or 0),
+            file_dev=int(cached.get("dev") or 0),
+            file_ino=int(cached.get("ino") or 0),
             watching=not startup_cold,
             stop_after_initial=startup_cold,
         )
@@ -2062,6 +2409,8 @@ class ClaudeTailTracker:
             "size": stat.st_size,
             "mtime": stat.st_mtime,
             "mtime_ns": stat.st_mtime_ns,
+            "dev": int(getattr(stat, "st_dev", 0)),
+            "ino": int(getattr(stat, "st_ino", 0)),
             "remainder": base64.b64encode(state.remainder).decode("ascii"),
         }
         key = str(path)
@@ -2097,6 +2446,9 @@ class ClaudeTailTracker:
                 if exact:
                     state.last_size = stat.st_size
                     state.last_mtime = stat.st_mtime
+                    state.last_mtime_ns = stat.st_mtime_ns
+                    state.file_dev = int(getattr(stat, "st_dev", 0))
+                    state.file_ino = int(getattr(stat, "st_ino", 0))
                     continue
                 if stat.st_size <= state.offset:
                     state.offset = 0
@@ -2143,8 +2495,11 @@ class ClaudeTailTracker:
                     state.watching = True
                     state.stop_after_initial = False
                     state.next_check = 0.0
-        for path in set(self.states) - current_paths:
+        removed = set(self.states) - current_paths
+        for path in removed:
             del self.states[path]
+        if removed:
+            self.rebuild_required = True
         return changed
 
     def _consume(self, data: bytes, state: ClaudeFileState) -> None:
@@ -2173,17 +2528,24 @@ class ClaudeTailTracker:
                 continue
             if event_time < self.scan_since:
                 continue
-            total_tokens = (
-                int(usage.get("input_tokens") or 0)
-                + int(usage.get("output_tokens") or 0)
-                + int(usage.get("cache_read_input_tokens") or 0)
-                + int(usage.get("cache_creation_input_tokens") or 0)
-            )
-            fingerprint = (
+            try:
+                total_tokens = sum(
+                    nonnegative_int(usage.get(field) or 0, field)
+                    for field in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    )
+                )
+            except ValueError:
+                self.errors += 1
+                continue
+            fingerprint = codex_fingerprint_digest((
                 str(event.get("sessionId") or "<unknown>"),
                 str(message.get("id") or event.get("uuid") or "<unknown>"),
                 model,
-            )
+            ))
             if fingerprint in self.seen:
                 continue
             self.seen.add(fingerprint)
@@ -2204,6 +2566,8 @@ class ClaudeTailTracker:
                     usage,
                     source="claude",
                     prices=self.prices,
+                    event_time=event_time,
+                    include_promotions=True,
                 )
                 if cost_usd is not None:
                     add_period_cost(
@@ -2231,11 +2595,30 @@ class ClaudeTailTracker:
             stat = path.stat()
             size = stat.st_size
             mtime = stat.st_mtime
-            if size < state.offset:
-                state.offset = 0
-                state.remainder = b""
+            device = int(getattr(stat, "st_dev", 0))
+            inode = int(getattr(stat, "st_ino", 0))
+            file_replaced = bool(
+                state.offset
+                and (
+                    (state.file_dev and device != state.file_dev)
+                    or (state.file_ino and inode and inode != state.file_ino)
+                )
+            )
+            if size < state.offset or file_replaced:
+                self.rebuild_required = True
+                return
+            if (
+                size == state.offset
+                and state.last_mtime_ns
+                and stat.st_mtime_ns != state.last_mtime_ns
+            ):
+                self.rebuild_required = True
+                return
             state.last_size = size
             state.last_mtime = mtime
+            state.last_mtime_ns = stat.st_mtime_ns
+            state.file_dev = device
+            state.file_ino = inode
             if size == state.offset:
                 if initial and state.stop_after_initial:
                     state.watching = False
@@ -2254,10 +2637,25 @@ class ClaudeTailTracker:
         except FileNotFoundError:
             if state.offset:
                 state.watching = False
+                self.rebuild_required = True
             else:
                 state.next_check = now + REFRESH_SECONDS
         except OSError:
             self.errors += 1
+
+    def _rebuild_all(self) -> None:
+        """Rebuild this source once after a notified historical rewrite."""
+        self.states.clear()
+        self.periods = empty_periods()
+        self.call_periods = empty_periods()
+        self.cost_periods = empty_periods()
+        self.seen.clear()
+        self.cached_files.clear()
+        self.last_event = None
+        self.cache_dirty = True
+        self.rebuild_required = False
+        self._discover_startup()
+        self._save_cache()
 
     def poll(self) -> None:
         changed = self._discover_changes()
@@ -2277,6 +2675,10 @@ class ClaudeTailTracker:
             if state is None:
                 continue
             self._read_path(path, state, now=now)
+            if self.rebuild_required:
+                break
+        if self.rebuild_required:
+            self._rebuild_all()
 
     def close(self) -> None:
         self._save_cache()
@@ -2288,15 +2690,27 @@ def load_cline_tasks() -> dict[str, tuple[str, int, datetime]]:
     if not CLINE_HISTORY.exists():
         return {}
     data = json.loads(CLINE_HISTORY.read_text(encoding="utf-8"))
+    if not isinstance(data, (dict, list)):
+        raise ValueError("Cline taskHistory root must be an object or list")
     history = data if isinstance(data, list) else data.get("taskHistory") or []
+    if not isinstance(history, list):
+        raise ValueError("Cline taskHistory must be a list")
     tasks = {}
     for task in history:
-        task_id = str(task.get("id") or task.get("ulid") or "<unknown>")
-        model = str(task.get("modelId") or "<unknown>")
-        total = int(task.get("tokensIn") or 0) + int(task.get("tokensOut") or 0)
-        timestamp = datetime.fromtimestamp(
-            int(task.get("ts") or 0) / 1000, timezone.utc
-        ).astimezone(SHANGHAI)
+        if not isinstance(task, dict):
+            continue
+        try:
+            task_id = str(task.get("id") or task.get("ulid") or "<unknown>")
+            model = str(task.get("modelId") or "<unknown>")
+            total = nonnegative_int(task.get("tokensIn") or 0, "tokensIn")
+            total += nonnegative_int(task.get("tokensOut") or 0, "tokensOut")
+            timestamp_ms = nonnegative_int(task.get("ts") or 0, "ts")
+            timestamp = datetime.fromtimestamp(
+                timestamp_ms / 1000,
+                timezone.utc,
+            ).astimezone(SHANGHAI)
+        except (OSError, OverflowError, ValueError):
+            continue
         tasks[task_id] = (model, total, timestamp)
     return tasks
 
@@ -2318,7 +2732,11 @@ class ClineTaskCache:
         except OSError:
             signature = (0.0, 0)
         if signature != self.last_signature:
-            self.cached = load_cline_tasks()
+            try:
+                loaded = load_cline_tasks()
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return dict(self.cached)
+            self.cached = loaded
             self.last_signature = signature
         return dict(self.cached)
 
@@ -2573,6 +2991,31 @@ class ClinePoller:
         self.request_counter.close()
 
 
+def _strip_yaml_inline_comment(value: str) -> str:
+    quote = ""
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and character == "\\":
+            escaped = True
+            continue
+        if character in "\"'":
+            if not quote:
+                quote = character
+            elif quote == character:
+                quote = ""
+            continue
+        if character == "#" and not quote and (
+            index == 0 or value[index - 1].isspace()
+        ):
+            return value[:index].rstrip()
+    if quote:
+        raise ValueError("unterminated quoted value in sub2api database config")
+    return value.strip()
+
+
 def load_sub2api_database_config(path: Path) -> dict[str, str]:
     """Read only the simple database mapping from sub2api's local YAML file."""
     values: dict[str, str] = {}
@@ -2590,7 +3033,7 @@ def load_sub2api_database_config(path: Path) -> dict[str, str]:
         )
         if not match:
             continue
-        value = match.group(2)
+        value = _strip_yaml_inline_comment(match.group(2))
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         values[match.group(1)] = value
@@ -2600,31 +3043,8 @@ def load_sub2api_database_config(path: Path) -> dict[str, str]:
     return values
 
 
-class DeepSeekApiPoller:
-    """Read DeepSeek API usage recorded by the local sub2api PostgreSQL service."""
-
-    QUERY = """
-SELECT
-    model,
-    to_char(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD'),
-    COALESCE(SUM(input_tokens), 0),
-    COALESCE(SUM(output_tokens), 0),
-    COALESCE(SUM(cache_creation_tokens), 0),
-    COALESCE(SUM(cache_read_tokens), 0),
-    COALESCE(SUM(
-        input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
-    ), 0),
-    COUNT(*),
-    to_char(
-        MAX(created_at) AT TIME ZONE 'Asia/Shanghai',
-        'YYYY-MM-DD"T"HH24:MI:SS.US'
-    ) || '+08:00'
-FROM usage_logs
-WHERE LOWER(model) LIKE 'deepseek%'
-  AND created_at >= TIMESTAMPTZ '2026-02-01 00:00:00+08'
-GROUP BY model, to_char(created_at AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD')
-ORDER BY MAX(created_at);
-""".strip()
+class IncrementalDeepSeekApiPoller(Sub2ApiUsagePoller):
+    """Configured incremental sub2api reader used by the live engine."""
 
     def __init__(
         self,
@@ -2632,134 +3052,18 @@ ORDER BY MAX(created_at);
         psql_path: Path | None = None,
         runner=None,
         prices: dict[str, dict[str, float]] | None = None,
-    ):
-        self.config_path = config_path or SUB2API_CONFIG
-        self.psql_path = psql_path or SUB2API_PSQL
-        self.runner = runner or subprocess.run
-        self.prices = prices or DEFAULT_PRICES
-        self.periods = empty_periods()
-        self.call_periods = empty_periods()
-        self.cost_periods = empty_periods()
-        self.status = "DeepSeek API 正在载入"
-        self.last_event: datetime | None = None
-        self.next_check = 0.0
-        self.poll(force=True)
-
-    def _command(self, config: dict[str, str]) -> list[str]:
-        return [
-            str(self.psql_path),
-            "-X",
-            "-w",
-            "-h",
-            config["host"],
-            "-p",
-            config["port"],
-            "-U",
-            config["user"],
-            "-d",
-            config["dbname"],
-            "-At",
-            "-F",
-            "\t",
-            "-c",
-            self.QUERY,
-        ]
-
-    def _replace_usage(self, output: str) -> None:
-        periods = empty_periods()
-        call_periods = empty_periods()
-        cost_periods = empty_periods()
-        latest: datetime | None = None
-        total_calls = 0
-        for line in output.splitlines():
-            if not line.strip():
-                continue
-            fields = line.split("\t", 8)
-            if len(fields) != 9:
-                raise ValueError("unexpected sub2api query output")
-            (
-                model,
-                day_text,
-                input_text,
-                output_text,
-                cache_write_text,
-                cache_read_text,
-                token_text,
-                call_text,
-                latest_text,
-            ) = fields
-            if not model.lower().startswith("deepseek"):
-                continue
-            event_date = date.fromisoformat(day_text)
-            tokens = int(token_text)
-            calls = int(call_text)
-            key = ("DeepSeek API", model)
-            add_period_usage(periods, key, tokens, event_date)
-            add_period_usage(call_periods, key, calls, event_date)
-            cost_usd = usage_cost_usd(
-                model,
-                {
-                    "input_tokens": int(input_text),
-                    "output_tokens": int(output_text),
-                    "cache_creation_input_tokens": int(cache_write_text),
-                    "cache_read_input_tokens": int(cache_read_text),
-                },
-                source="claude",
-                prices=self.prices,
-            )
-            if cost_usd is not None:
-                add_period_cost(cost_periods, key, cost_usd, event_date)
-            total_calls += calls
-            row_latest = parse_time(latest_text)
-            if latest is None or row_latest > latest:
-                latest = row_latest
-        self.periods = periods
-        self.call_periods = call_periods
-        self.cost_periods = cost_periods
-        self.last_event = latest
-        latest_label = (
-            latest.astimezone(SHANGHAI).strftime("%m-%d %H:%M:%S")
-            if latest
-            else "无记录"
+        cache_path: Path | None = None,
+        now=None,
+    ) -> None:
+        super().__init__(
+            config_path or SUB2API_CONFIG,
+            psql_path or SUB2API_PSQL,
+            runner=runner,
+            prices=prices or DEFAULT_PRICES,
+            cache_path=cache_path,
+            config_loader=load_sub2api_database_config,
+            now=now,
         )
-        self.status = f"DeepSeek API：{total_calls} 次，最新 {latest_label}"
-
-    def poll(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now < self.next_check:
-            return
-        self.next_check = now + SUB2API_POLL_SECONDS
-        try:
-            if not self.config_path.is_file() or not self.psql_path.is_file():
-                self.status = "DeepSeek API：未检测到 sub2api"
-                return
-            config = load_sub2api_database_config(self.config_path)
-            environment = dict(os.environ)
-            environment["PGPASSWORD"] = config.get("password", "")
-            result = self.runner(
-                self._command(config),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=3.0,
-                check=False,
-                env=environment,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if result.returncode != 0:
-                self.status = f"DeepSeek API：sub2api 查询失败 ({result.returncode})"
-                return
-            self._replace_usage(result.stdout)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            detail = re.sub(r"\s+", " ", str(exc)).strip()[:120]
-            self.status = f"DeepSeek API：{type(exc).__name__} ({detail})"
-
-    def roll_periods(self, previous_date: date, current_date: date) -> None:
-        rollover_periods(self.periods, previous_date, current_date)
-        rollover_periods(self.call_periods, previous_date, current_date)
-        rollover_periods(self.cost_periods, previous_date, current_date)
-        self.next_check = 0.0
 
 
 @dataclass(frozen=True)
@@ -2780,9 +3084,16 @@ class UsageSnapshot:
         limit: int = DEFAULT_ROW_COUNT,
     ) -> list[tuple[tuple[str, str], int]]:
         values = self.periods.get(period, {})
-        return sorted(values.items(), key=lambda item: item[1], reverse=True)[
-            : max(0, int(limit))
-        ]
+        return sorted(
+            values.items(),
+            key=lambda item: (
+                -item[1],
+                item[0][0].casefold(),
+                item[0][1].casefold(),
+                item[0][0],
+                item[0][1],
+            ),
+        )[: max(0, int(limit))]
 
     def call_count(self, period: str) -> int:
         return sum(self.call_periods.get(period, {}).values())
@@ -2877,7 +3188,9 @@ class UsageEngine:
         self.claude_usage = ClaudeUsageCache()
         self.claude_boundary: datetime | None = None
         self.cline: ClinePoller | None = None
-        self.deepseek_api: DeepSeekApiPoller | None = None
+        self.dsh: DshTailTracker | None = None
+        self.deepseek_api: IncrementalDeepSeekApiPoller | None = None
+        self.source_warnings: list[str] = []
         self.period_date = datetime.now(SHANGHAI).date()
         self.next_report_check = 0.0
         self._load_snapshot_cache()
@@ -2887,7 +3200,8 @@ class UsageEngine:
     def _load_snapshot_cache(self) -> None:
         try:
             payload = json.loads(self.snapshot_cache_path.read_text(encoding="utf-8"))
-            if int(payload.get("version") or 0) != USAGE_SNAPSHOT_CACHE_VERSION:
+            version = int(payload.get("version") or 0)
+            if version not in (7, USAGE_SNAPSHOT_CACHE_VERSION):
                 return
             cached_report_dir = Path(str(payload["report_dir"])).resolve()
             if cached_report_dir != self.report_dir.resolve():
@@ -2912,7 +3226,11 @@ class UsageEngine:
             self.period_date,
         )
         self.snapshot = snapshot
-        self.snapshot_cache_signature = usage_snapshot_signature(snapshot)
+        self.snapshot_cache_signature = (
+            usage_snapshot_signature(snapshot)
+            if version == USAGE_SNAPSHOT_CACHE_VERSION
+            else None
+        )
 
     def _load_report_preview(self) -> None:
         try:
@@ -2968,32 +3286,83 @@ class UsageEngine:
                 pass
 
     def _close_trackers(self) -> None:
-        if self.codex is not None:
-            self.codex.close()
-        if self.claude is not None:
-            self.claude.close()
-        if self.cline is not None:
-            self.cline.close()
+        for name, tracker in (
+            ("Codex", self.codex),
+            ("Claude Code", self.claude),
+            ("Cline", self.cline),
+            ("DeepSeek Harness", self.dsh),
+            ("Sub2API", self.deepseek_api),
+        ):
+            if tracker is None:
+                continue
+            try:
+                tracker.close()
+            except Exception as exc:
+                self.source_warnings.append(
+                    f"{name} 关闭失败，已跳过：{type(exc).__name__}"
+                )
 
     def _reload(self) -> None:
         baseline = load_baseline(self.report_dir)
         self.prices = load_pricing(self.report_dir)
         self._close_trackers()
+        self.source_warnings = list(baseline.warnings)
         self.baseline = baseline
-        self.codex = CodexTailTracker(
-            self.baseline.refreshed_at,
-            prices=self.prices,
+        self.codex = None
+        self.claude = None
+        self.cline = None
+        self.dsh = None
+        self.deepseek_api = None
+
+        def start_source(name: str, factory):
+            try:
+                return factory()
+            except Exception as exc:
+                self.source_warnings.append(
+                    f"{name} 未检测到或初始化失败，已跳过：{type(exc).__name__}"
+                )
+                return None
+
+        self.codex = start_source(
+            "Codex",
+            lambda: CodexTailTracker(
+                self.baseline.refreshed_at,
+                prices=self.prices,
+            ),
         )
-        _, _, claude_boundary = self.claude_usage.read()
-        self.claude = ClaudeTailTracker(
-            claude_boundary,
-            call_since=self.baseline.refreshed_at,
-            cost_since=self.baseline.refreshed_at,
-            prices=self.prices,
+
+        def start_claude():
+            _, _, boundary = self.claude_usage.read()
+            self.claude_boundary = boundary
+            return ClaudeTailTracker(
+                boundary,
+                call_since=self.baseline.refreshed_at,
+                cost_since=self.baseline.refreshed_at,
+                prices=self.prices,
+            )
+
+        self.claude = start_source("Claude Code", start_claude)
+        self.cline = start_source("Cline", lambda: ClinePoller(self.baseline))
+        self.dsh = start_source(
+            "DeepSeek Harness",
+            lambda: DshTailTracker(
+                root=DSH_SESSIONS,
+                watcher=DirectoryChangeWatcher(DSH_SESSIONS),
+                prices=self.prices,
+                excluded_providers=("sub2api",),
+            ),
         )
-        self.claude_boundary = claude_boundary
-        self.cline = ClinePoller(self.baseline)
-        self.deepseek_api = DeepSeekApiPoller(prices=self.prices)
+        self.deepseek_api = start_source(
+            "Sub2API",
+            lambda: IncrementalDeepSeekApiPoller(prices=self.prices),
+        )
+        if self.codex is not None and self.deepseek_api is not None:
+            try:
+                self.codex.set_model_resolver(self.deepseek_api.resolve_model)
+            except Exception as exc:
+                self.source_warnings.append(
+                    f"Sub2API 模型映射未应用，已跳过：{type(exc).__name__}"
+                )
 
     def _roll_periods_if_needed(self, current_date: date) -> None:
         if current_date <= self.period_date:
@@ -3034,27 +3403,47 @@ class UsageEngine:
                 current_date,
             )
             tracker.cache_dirty = True
-        if self.cline is not None:
-            self.cline.roll_periods(previous_date, current_date)
-        if self.deepseek_api is not None:
-            self.deepseek_api.roll_periods(previous_date, current_date)
+        for name, tracker in (
+            ("Cline", self.cline),
+            ("DeepSeek Harness", self.dsh),
+            ("Sub2API", self.deepseek_api),
+        ):
+            if tracker is None:
+                continue
+            try:
+                tracker.roll_periods(previous_date, current_date)
+            except Exception as exc:
+                self.source_warnings.append(
+                    f"{name} 日期切换失败，已跳过：{type(exc).__name__}"
+                )
         snapshot = self.get_snapshot()
         if snapshot is not None:
-            rollover_periods(
-                snapshot.periods,
-                previous_date,
-                current_date,
+            periods = {
+                period: dict(snapshot.periods.get(period, {})) for period in PERIODS
+            }
+            call_periods = {
+                period: dict(snapshot.call_periods.get(period, {}))
+                for period in PERIODS
+            }
+            cost_periods = {
+                period: dict(snapshot.cost_periods.get(period, {}))
+                for period in PERIODS
+            }
+            rollover_periods(periods, previous_date, current_date)
+            rollover_periods(call_periods, previous_date, current_date)
+            rollover_periods(cost_periods, previous_date, current_date)
+            rolled = UsageSnapshot(
+                periods=periods,
+                call_periods=call_periods,
+                cost_periods=cost_periods,
+                updated_at=snapshot.updated_at,
+                report_time=snapshot.report_time,
+                source_status=snapshot.source_status,
+                error=snapshot.error,
             )
-            rollover_periods(
-                snapshot.call_periods,
-                previous_date,
-                current_date,
-            )
-            rollover_periods(
-                snapshot.cost_periods,
-                previous_date,
-                current_date,
-            )
+            with self.lock:
+                if self.snapshot is snapshot:
+                    self.snapshot = rolled
         self.period_date = current_date
 
     def refresh_once(self) -> UsageSnapshot:
@@ -3076,69 +3465,109 @@ class UsageEngine:
             else:
                 self._roll_periods_if_needed(current_date)
             assert self.baseline is not None
-            assert self.codex is not None
-            assert self.claude is not None
-            assert self.cline is not None
-            assert self.deepseek_api is not None
-            self.codex.poll()
-            self.cline.poll()
-            self.deepseek_api.poll()
-            claude_periods, claude_status, claude_boundary = self.claude_usage.read()
-            if self.claude is None or self.claude_boundary != claude_boundary:
+            pollers = (
+                ("Codex", self.codex),
+                ("Cline", self.cline),
+                ("DeepSeek Harness", self.dsh),
+                ("Sub2API", self.deepseek_api),
+            )
+            for name, tracker in pollers:
+                if tracker is None:
+                    continue
+                try:
+                    tracker.poll()
+                except Exception as exc:
+                    self.source_warnings.append(
+                        f"{name} 读取失败，本次已跳过：{type(exc).__name__}"
+                    )
+            if self.codex is not None and self.deepseek_api is not None:
+                try:
+                    self.codex.set_model_resolver(self.deepseek_api.resolve_model)
+                except Exception as exc:
+                    self.source_warnings.append(
+                        f"Sub2API 模型映射未应用，本次已跳过：{type(exc).__name__}"
+                    )
+            claude_periods = empty_periods()
+            claude_status = "Claude Code：未检测到"
+            claude_boundary = self.claude_boundary
+            try:
+                claude_periods, claude_status, claude_boundary = self.claude_usage.read()
+                if self.claude is None or self.claude_boundary != claude_boundary:
+                    if self.claude is not None:
+                        self.claude.close()
+                    self.claude = ClaudeTailTracker(
+                        claude_boundary,
+                        call_since=self.baseline.refreshed_at,
+                        cost_since=self.baseline.refreshed_at,
+                        prices=self.prices,
+                    )
+                    self.claude_boundary = claude_boundary
                 if self.claude is not None:
-                    self.claude.close()
-                self.claude = ClaudeTailTracker(
-                    claude_boundary,
-                    call_since=self.baseline.refreshed_at,
-                    cost_since=self.baseline.refreshed_at,
-                    prices=self.prices,
+                    self.claude.poll()
+            except Exception as exc:
+                self.source_warnings.append(
+                    f"Claude Code 读取失败，本次已跳过：{type(exc).__name__}"
                 )
-                self.claude_boundary = claude_boundary
-            self.claude.poll()
+                claude_periods = empty_periods()
+                claude_status = "Claude Code：读取失败，已跳过"
             combined_periods = {}
             combined_call_periods = {}
             combined_cost_periods = {}
             for period in PERIODS:
                 values = Counter(self.baseline.periods[period])
-                values.update(self.codex.periods[period])
-                for key in [key for key in values if key[0] == "Claude Code"]:
-                    del values[key]
-                values.update(claude_periods[period] + self.claude.periods[period])
-                for key in [key for key in values if key[0] == "Cline"]:
-                    del values[key]
-                values.update(self.cline.periods[period])
-                for key in [key for key in values if key[0] == "DeepSeek API"]:
-                    del values[key]
-                values.update(self.deepseek_api.periods[period])
+                if self.codex is not None:
+                    values.update(self.codex.periods[period])
+                if self.claude is not None:
+                    for key in [key for key in values if key[0] == "Claude Code"]:
+                        del values[key]
+                    values.update(
+                        claude_periods[period] + self.claude.periods[period]
+                    )
+                if self.cline is not None:
+                    for key in [key for key in values if key[0] == "Cline"]:
+                        del values[key]
+                    values.update(self.cline.periods[period])
+                if self.dsh is not None:
+                    for key in [key for key in values if key[0] == "DeepSeek Harness"]:
+                        del values[key]
+                    values.update(self.dsh.periods[period])
                 combined_periods[period] = dict(values)
                 calls = Counter(self.baseline.call_periods[period])
-                calls.update(self.codex.call_periods[period])
-                calls.update(self.claude.call_periods[period])
-                for key in [key for key in calls if key[0] == "Cline"]:
-                    del calls[key]
-                calls.update(self.cline.call_periods[period])
-                for key in [key for key in calls if key[0] == "DeepSeek API"]:
-                    del calls[key]
-                calls.update(self.deepseek_api.call_periods[period])
+                if self.codex is not None:
+                    calls.update(self.codex.call_periods[period])
+                if self.claude is not None:
+                    calls.update(self.claude.call_periods[period])
+                if self.cline is not None:
+                    for key in [key for key in calls if key[0] == "Cline"]:
+                        del calls[key]
+                    calls.update(self.cline.call_periods[period])
+                if self.dsh is not None:
+                    for key in [key for key in calls if key[0] == "DeepSeek Harness"]:
+                        del calls[key]
+                    calls.update(self.dsh.call_periods[period])
                 combined_call_periods[period] = dict(calls)
                 costs = Counter(self.baseline.cost_periods[period])
-                costs.update(self.codex.cost_periods[period])
-                costs.update(self.claude.cost_periods[period])
-                for key in [key for key in costs if key[0] == "Cline"]:
-                    del costs[key]
-                costs.update(self.cline.cost_periods[period])
-                for key in [key for key in costs if key[0] == "DeepSeek API"]:
-                    del costs[key]
-                costs.update(self.deepseek_api.cost_periods[period])
+                if self.codex is not None:
+                    costs.update(self.codex.cost_periods[period])
+                if self.claude is not None:
+                    costs.update(self.claude.cost_periods[period])
+                if self.cline is not None:
+                    for key in [key for key in costs if key[0] == "Cline"]:
+                        del costs[key]
+                    costs.update(self.cline.cost_periods[period])
+                if self.dsh is not None:
+                    for key in [key for key in costs if key[0] == "DeepSeek Harness"]:
+                        del costs[key]
+                    costs.update(self.dsh.cost_periods[period])
                 combined_cost_periods[period] = dict(costs)
             last_event = (
                 self.codex.last_event.astimezone(SHANGHAI).strftime("%H:%M:%S")
-                if self.codex.last_event
+                if self.codex is not None and self.codex.last_event
                 else "无新增"
             )
             claude_last_event = (
                 self.claude.last_event.astimezone(SHANGHAI).strftime("%m-%d %H:%M:%S")
-                if self.claude.last_event
+                if self.claude is not None and self.claude.last_event
                 else "无新增"
             )
             snapshot = UsageSnapshot(
@@ -3148,10 +3577,28 @@ class UsageEngine:
                 updated_at=datetime.now(SHANGHAI),
                 report_time=self.baseline.refreshed_at.astimezone(SHANGHAI),
                 source_status=(
-                    f"Codex 增量事件：{self.codex.fingerprint_count()}，最新 {last_event}",
-                    f"{claude_status}，尾读 {len(self.claude.seen)} 条，最新 {claude_last_event}",
-                    self.cline.status,
-                    self.deepseek_api.status,
+                    (
+                        f"Codex 增量事件：{self.codex.fingerprint_count()}，最新 {last_event}"
+                        if self.codex is not None
+                        else "Codex：未检测到，已跳过"
+                    ),
+                    (
+                        f"{claude_status}，尾读 {len(self.claude.seen)} 条，最新 {claude_last_event}"
+                        if self.claude is not None
+                        else claude_status
+                    ),
+                    self.cline.status if self.cline is not None else "Cline：未检测到，已跳过",
+                    (
+                        f"DeepSeek Harness：{self.dsh.status}，错误 {self.dsh.errors}"
+                        if self.dsh is not None
+                        else "DeepSeek Harness：未检测到，已跳过"
+                    ),
+                    (
+                        self.deepseek_api.status
+                        if self.deepseek_api is not None
+                        else "Sub2API：未检测到，已跳过"
+                    ),
+                    *tuple(dict.fromkeys(self.source_warnings)),
                 ),
             )
         except Exception as exc:
@@ -3368,6 +3815,7 @@ class FloatingRankRow:
         call_delta: int,
         cost_value: float,
         cost_delta: float,
+        delta_visible_ms: int = LIVE_DELTA_VISIBLE_MS,
     ) -> None:
         platform, model = key if key else ("—", "暂无数据")
         key_changed = key != self.current_key
@@ -3400,7 +3848,7 @@ class FloatingRankRow:
             force=key_changed,
         )
         if delta > 0:
-            self._show_delta(delta)
+            self._show_delta(delta, delta_visible_ms)
 
     @staticmethod
     def _create_incoming_text(
@@ -3655,11 +4103,18 @@ class FloatingRankRow:
         self.cost_text.set_text(format_cost(self.cost_value))
         self.cost_color_job = None
 
-    def _show_delta(self, delta: int) -> None:
+    def _show_delta(
+        self,
+        delta: int,
+        visible_ms: int = LIVE_DELTA_VISIBLE_MS,
+    ) -> None:
         if self.delta_hide_job is not None:
             self.frame.after_cancel(self.delta_hide_job)
         self.delta_text.set_text(f"+{int(delta):,}")
-        self.delta_hide_job = self.frame.after(1600, self._clear_delta)
+        self.delta_hide_job = self.frame.after(
+            max(1, int(visible_ms)),
+            self._clear_delta,
+        )
 
     def _clear_delta(self) -> None:
         self.delta_text.set_text("")
@@ -3699,12 +4154,33 @@ class LiveUsageApp:
         self.row_count = load_row_count()
         self.refresh_seconds = apply_refresh_seconds(load_refresh_seconds())
         self.refresh_after_id: str | None = None
+        self.topmost_after_id: str | None = None
         self.period = "cumulative"
         self.transparent = "#010101"
         self.drag_origin: tuple[int, int] | None = None
         self.previous_values = {period: {} for period in PERIODS}
         self.previous_calls = {period: {} for period in PERIODS}
         self.previous_costs = {period: {} for period in PERIODS}
+        self.startup_snapshot = self.engine.get_snapshot()
+        self.startup_values = {
+            period: dict(self.startup_snapshot.periods.get(period, {}))
+            if self.startup_snapshot is not None
+            else {}
+            for period in PERIODS
+        }
+        self.startup_calls = {
+            period: dict(self.startup_snapshot.call_periods.get(period, {}))
+            if self.startup_snapshot is not None
+            else {}
+            for period in PERIODS
+        }
+        self.startup_costs = {
+            period: dict(self.startup_snapshot.cost_periods.get(period, {}))
+            if self.startup_snapshot is not None
+            else {}
+            for period in PERIODS
+        }
+        self.startup_reconcile_pending = self.startup_snapshot is not None
         self.period_changed = False
         self.last_background_check = 0.0
         self.manual_foreground = False
@@ -3732,6 +4208,7 @@ class LiveUsageApp:
         self._apply_adaptive_foregrounds()
         self.root.deiconify()
         self.root.lift()
+        self._ensure_topmost()
         self.engine.start()
         self._schedule_refresh(initial=True)
         if screenshot_path:
@@ -4023,6 +4500,50 @@ class LiveUsageApp:
         delay_ms = 100 if initial else max(50, round(self.refresh_seconds * 1000))
         self.refresh_after_id = self.root.after(delay_ms, self._refresh_ui)
 
+    def _ensure_topmost(self) -> None:
+        try:
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+            if os.name == "nt":
+                import ctypes
+                import ctypes.wintypes
+
+                user32 = ctypes.windll.user32
+                user32.GetAncestor.argtypes = (
+                    ctypes.wintypes.HWND,
+                    ctypes.wintypes.UINT,
+                )
+                user32.GetAncestor.restype = ctypes.wintypes.HWND
+                user32.SetWindowPos.argtypes = (
+                    ctypes.wintypes.HWND,
+                    ctypes.wintypes.HWND,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.wintypes.UINT,
+                )
+                user32.SetWindowPos.restype = ctypes.wintypes.BOOL
+                hwnd = user32.GetAncestor(
+                    ctypes.wintypes.HWND(self.root.winfo_id()),
+                    2,
+                )
+                if hwnd:
+                    user32.SetWindowPos(
+                        hwnd,
+                        ctypes.wintypes.HWND(-1),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0x0001 | 0x0002 | 0x0010,
+                    )
+            else:
+                self.root.attributes("-topmost", True)
+            self.topmost_after_id = self.root.after(3000, self._ensure_topmost)
+        except tk.TclError:
+            self.topmost_after_id = None
+
     def _position_top_right(self) -> None:
         self.root.update_idletasks()
         requested_geometry = os.environ.get("TOKENWATCHER_WINDOW_GEOMETRY", "").strip()
@@ -4051,6 +4572,10 @@ class LiveUsageApp:
             )
 
     def _capture_background(self):
+        user32 = None
+        dwmapi = None
+        hwnd = 0
+        capture_exclusion_applied = False
         try:
             from PIL import ImageGrab
 
@@ -4065,13 +4590,15 @@ class LiveUsageApp:
                 import ctypes.wintypes
 
                 user32 = ctypes.windll.user32
+                dwmapi = ctypes.windll.dwmapi
                 hwnd = user32.GetAncestor(self.root.winfo_id(), 2)
-                # Keep the overlay visible while excluding it from the image
-                # used for contrast sampling. The previous foreground cannot
-                # feed back into the next pure black/white choice, and no
-                # visible hide/show frame is needed.
-                user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
-                ctypes.windll.dwmapi.DwmFlush()
+                # Exclude the overlay only while sampling its background. Keeping
+                # this flag set would also remove it from normal user screenshots.
+                capture_exclusion_applied = bool(
+                    hwnd
+                    and user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+                )
+                dwmapi.DwmFlush()
                 rect = ctypes.wintypes.RECT()
                 if hwnd and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     get_dpi_for_window = getattr(
@@ -4099,6 +4626,11 @@ class LiveUsageApp:
             return image
         except Exception:
             return None
+        finally:
+            if capture_exclusion_applied and user32 is not None:
+                user32.SetWindowDisplayAffinity(hwnd, 0)
+                if dwmapi is not None:
+                    dwmapi.DwmFlush()
 
     def _adaptive_texts(self) -> tuple[AdaptiveCanvasText, ...]:
         texts = [
@@ -4170,18 +4702,46 @@ class LiveUsageApp:
     def _refresh_ui(self, schedule: bool = True) -> None:
         snapshot = self.engine.get_snapshot()
         if snapshot:
+            startup_reconcile = bool(
+                self.startup_reconcile_pending
+                and snapshot is not self.startup_snapshot
+                and not snapshot.error
+            )
             top = snapshot.top(self.period, self.row_count)
-            previous = self.previous_values[self.period]
-            previous_calls = self.previous_calls[self.period]
-            previous_costs = self.previous_costs[self.period]
+            previous = (
+                self.startup_values[self.period]
+                if startup_reconcile
+                else self.previous_values[self.period]
+            )
+            previous_calls = (
+                self.startup_calls[self.period]
+                if startup_reconcile
+                else self.previous_calls[self.period]
+            )
+            previous_costs = (
+                self.startup_costs[self.period]
+                if startup_reconcile
+                else self.previous_costs[self.period]
+            )
             for index, card in enumerate(self.cards):
                 if index < len(top):
                     key, value = top[index]
-                    delta = value - previous.get(key, value)
+                    delta = observed_growth(
+                        value,
+                        previous,
+                        key,
+                        include_new_key=startup_reconcile,
+                    )
                     call_value = snapshot.call_periods.get(self.period, {}).get(key, 0)
-                    call_delta = call_value - previous_calls.get(key, call_value)
+                    call_delta = call_value - previous_calls.get(
+                        key,
+                        0 if startup_reconcile else call_value,
+                    )
                     cost_value = snapshot.cost_periods.get(self.period, {}).get(key)
-                    previous_cost = previous_costs.get(key)
+                    previous_cost = previous_costs.get(
+                        key,
+                        0.0 if startup_reconcile else None,
+                    )
                     cost_delta = (
                         cost_value - previous_cost
                         if cost_value is not None and previous_cost is not None
@@ -4195,6 +4755,9 @@ class LiveUsageApp:
                         0 if self.period_changed else call_delta,
                         cost_value,
                         0.0 if self.period_changed else cost_delta,
+                        STARTUP_DELTA_VISIBLE_MS
+                        if startup_reconcile
+                        else LIVE_DELTA_VISIBLE_MS,
                     )
                 else:
                     card.update(None, 0, 0, 0, 0, None, 0.0)
@@ -4206,6 +4769,8 @@ class LiveUsageApp:
                 self.previous_costs[period] = dict(
                     snapshot.cost_periods.get(period, {})
                 )
+            if startup_reconcile:
+                self.startup_reconcile_pending = False
             self.period_changed = False
             top_total = sum(value for _, value in top)
             source_text = (
@@ -4287,12 +4852,15 @@ class LiveUsageApp:
         return image.convert("RGB")
 
     def close(self) -> None:
-        if self.refresh_after_id is not None:
+        for attribute in ("refresh_after_id", "topmost_after_id"):
+            job = getattr(self, attribute, None)
+            if job is None:
+                continue
             try:
-                self.root.after_cancel(self.refresh_after_id)
+                self.root.after_cancel(job)
             except tk.TclError:
                 pass
-            self.refresh_after_id = None
+            setattr(self, attribute, None)
         self.engine.stop()
         self.root.destroy()
 
@@ -4343,13 +4911,14 @@ def main() -> int:
             snapshot = engine.refresh_once()
             payload = snapshot_payload(snapshot)
             output = json.dumps(payload, ensure_ascii=False, indent=2)
-            if args.snapshot_json and args.snapshot_json != "-":
-                output_path = Path(args.snapshot_json)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(output, encoding="utf-8")
-            elif not getattr(sys, "frozen", False):
-                print(output)
-            return 0 if not snapshot.error and len(snapshot.top("cumulative")) == 3 else 1
+            if args.snapshot_json not in (None, "-"):
+                try:
+                    write_text_atomic(Path(args.snapshot_json), output)
+                except OSError:
+                    return 2
+            elif not emit_stdout(output):
+                return 2
+            return 0 if not snapshot.error else 1
         finally:
             engine.stop()
     instance_mutex = acquire_single_instance_mutex()
